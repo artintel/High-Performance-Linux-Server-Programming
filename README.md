@@ -141,3 +141,59 @@ readv 函数和 writev 函数
  ./tee test.txt
  功能实现
  ```
+
+## fcntl 函数
+
+`fcntl` (file control), 提供了对文件描述符的各种控制操作。另一个常见的控制文件描述符和行为的系统调用是 `ioctl`, 而且 `ioctl` 比 `fcntl` 能够执行更多的控制。定义如下：
+
+```C
+#include <fcntl.h>
+int fcntl( int fd, int cmd, ... );
+```
+
+- `fd` 被操作的文件描述符
+- `cmd` 指定执行何种类型的操作。根据操作类型的不同，该函数可能还需要第三个可选参数 `arg`
+
+在网络变成中， `fcntl` 函数通常用来将一个文件描述符设置为非阻塞的。
+
+```C
+int setnonblocking( int fd ){
+    int old_option = fcntl( fd, F_GETFL );		/* 获取文件描述符旧的状态标志 */
+    int new_option = old_option | O_NONBLOCK;	/* 设置为非阻塞状态 */
+    fcntl( fd, F_SETFL, new_option );
+    return old_option;						  /* 返回文件描述符旧的状态标志，以便日后回复该状态标志 */
+}
+```
+
+## 第7章 Linux 服务器程序规范
+
+本章综述了以下关于 linux 的进程，用户，组之类的概念。
+
+下面的代码表示了如何在代码中让一个进程以守护进程的方式运行。
+
+```c
+bool daemonize(){
+    /* 创建子进程，关闭父进程， 这样可以使程序在后台运行 */
+    pid_t pid = fork();
+    if( pid < 0 ) return false;
+    else if( pid > 0 ) exit();
+    /* 设置文件权限掩码。当进程创建新文件 (使用 open( const char* pathname, int flags, mode_t mode ) 系统调用) 时，
+    文件的权限将是 mode & 0777 */
+    umask( 0 );
+    /* 创建新的会话，设置本进程为进程组的首领 */
+    pid_t sid = setsid();
+    if ( sid < 0 ) return false;
+    /* 切换工作目录 */
+    if ( ( chdir( "/" ) ) > 0 ) return false;
+    /* 关闭标准输入设备、标准输出设备和标准错误输出设备 */
+    close( STDIN_FILENO );
+    close( STDOUT_FILENO );
+    close( STDERR_FILENO );
+    /* 关闭其他已经打开的文件描述符，代码省略 */
+    /* 将标准输入、标准输出和标准错误输出都定向到 /dev/null 文件 */
+    open( "/dev/null", O_RDONLY );
+    open( "/dev/null", O_RDWR );
+    open( "/dev/null", O_RDWR );
+    return true;
+}
+```
