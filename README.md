@@ -774,3 +774,19 @@ g++ -o EPOLLONESHOT EPOLLONESHOT.cpp
 `connect` 出错时有一种 errno 值：EINPROGRESS。这种错误发生在对非阻塞的 `socket` 调用 `connect` ，而连接又没有立即建立时。根据 `man` 文档的解释，在这种情况下，我们可以调用 `select、poll` 等函数来监听跟这个连接失败的 `socket` 上的可写事件。当 `select、poll` 等函数返回后，再利用 `getsockopt` 来读取错误码并清除该 `socket` 上的错误。
 
 通过上面描述的非阻塞 `connect` 方式，就可以同时发起多个连接并一起等待。 
+
+**connect.cpp**
+
+然，这种方法存在几个移植性问题。首先，非阻塞的 `socket` 可能导致 `connect` 始终失败。其次， `select` 对处于 `EINPROGRESS` 状态下的 `socket` 可能不起作用。最后，对于出错的 `socket,getsockopt` 在有些系统( 比如 Linux ) 上返回 -1，而有些返回 0.
+
+## 9.6  I/O复用的高级应用二：聊天室程序
+
+### 9.6.1 客户端
+
+客户端程序使用 `poll` 同时监听用户输入和网络连接，并利用 `splice` 函数将用户输入内容直接定向到网络连接上以发送之，从而实现数据零拷贝，提高了程序执行效率。
+
+**client.cpp**
+
+**server.cpp**
+
+## 9.7 I/O 复用的高级应用三：同时处理 TCP 和 UDP 服务
