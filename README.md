@@ -791,10 +791,255 @@ g++ -o EPOLLONESHOT EPOLLONESHOT.cpp
 
 ## 9.7 I/O 复用的高级应用三：同时处理 TCP 和 UDP 服务
 
-## 9.7 I/O 复用的高级应用三：同时处理 TCP 和 UDP 服务
-
 在实际应用中，有不少服务器程序能同时监听多个端口，比如超级服务 `inetd` 和 `android` 的调试服务 `adbd`。
 
 从 `bind` 系统调用的参数来看，一个 `socket` 只能与一个 `soscket` 地址绑定，即一个 `socket` 只能用来监听一个端口。因此，服务器如果要同时监听多个端口，就必须创建多个 `socket`, 并将他们分别绑定到各个端口上。这样一来，服务器程序就需要同时监听处理该端口上的 TCP 和 UDP 请求，则也需要创建两个不同的 `socket` ：一个是流 `socket` ，另一个是出举报 `socket` ，并将他们都绑定到该端口上。
 
 **TCP_UDP.cpp**
+
+##  9.8 超级服务 xinetd
+
+`Linux` 因特网服务 `inetd` 是超级服务，它同时管理着多个子服务，即监听多个端口。现在 `Linux` 系统上使用 `inetd` 服务程序通常是其升级版本 `xinetd`。`xinetd` 程序的原理与 `inetd` 相同，但增加了一些控制选项，并提高了安全性。
+
+### 9.8.1 xinetd 配置文件
+
+`xinetd` 采用 `/etc/xinetd.conf` 主配置文件和 `etc/xinetd.d` 目录下的子配置文件来管理所有服务。主配置文件包含的是通用选项，这些选项将被所有子配置文件继承，并且可以被子配置文件覆盖。每个子配置文件用于设置一个自服务的参数。比如 `telnet` 子服务的配置文件 `/etc/xinetd.d/telnet` 的典型内容如下：
+
+```cpp
+# default: on
+# description: The telnet server serves telnet sessions; it uses \
+# unencrypted username/password pairs for oauthentication.
+service telnet {
+    flags                = REUSE
+    socket_type          = stream
+    wait                 = no
+    user                 = root
+    server               = /usr/sbin/in.telnetd
+    log_on_failure       = USERID
+    disable              = no
+}
+```
+
+上面每一项的含义如下：
+
+| 项目           | 含义                                                         |
+| -------------- | ------------------------------------------------------------ |
+| service        | 服务名                                                       |
+| flags          | 设置连接的标志。REUSE 表示复用 telnet 连接的 socket 。该标志已经过时。每个连接都默认启用 REUSE 标志 |
+| socket_types   | 服务类型                                                     |
+| wait           | 服务采用单线程方式 ( wait = yes ) 还是多线程方式 ( wait = no )。单线程方式表示 xinetd 只 accept 第一次连接，此后将由子服务进程来 accept 新连接。多线程方式表示 xinetd 一直负责 accept 连接，而子服务进程仅处理连接 socket 上的数据读写 |
+| user           | 子服务进程将以 user 指定的用户身份运行                       |
+| server         | 子服务程序的完整路径                                         |
+| log_on_failure | 定义当服务不能启动时输出日志的参数                           |
+| disable        | 是否启动该子服务                                             |
+
+### 9.8.3 xinetd 工作流程
+
+`xinetd` 管理的子服务中有的是标准服务，比如时间日期服务 `daytime`, 回射服务 `echo` 和 丢弃服务 `discard`。`xinetd` 服务器在内部直接处理这些服务。还有的子服务则需要调用外部的服务器程序来处理。`xinetd` 通过调用 `fork` 和 `exec` 函数来加载运行这些服务器程序。比如 `telnet、ftp` 服务都是这种类型的子服务。
+
+查看 `xinetd` 守护进程的 PID 
+
+```bash
+$ cat /var/run/xinetd.pid
+4862
+```
+
+![32E995F7F03CED06131F2CC782A64822](image/32E995F7F03CED06131F2CC782A64822.png)
+
+# 第 10 章 信号
+
+信号是由用户、系统或者进程发送给目标进程的信息，以通知目标进程某个状态的改变或系统异常。`Linux` 信号可由如下条件产生：
+
+- 对于前台进程，用户可以通过输入特殊的终端字符来给它发信号。比如输入 `Ctrl + C` 通常会给进程发送一个中断信号
+- 系统异常。比如浮点异常和非法内存段访问
+- 系统状态变化。比如 `alarm` 定时器到期将引起 `SIGALRM` 信号
+- 运行 `kill` 命令或调用 `kill` 函数
+
+服务器必须能处理(或至少忽略)一些常见的信号，以免异常终止
+
+## 10.1 Linux 信号概述
+
+### 10.1.1 发送信号
+
+`Linux` 下，一个进程给其他进程发送信号的 `API` 是 `kill` 函数。其定义如下：
+
+```cpp
+#include <sys/types.h>
+#include <signal.h>
+int kill( pid_t pid, int sig );
+```
+
+该函数把信号 `sig` 发送给目标进程；目标进程由 `pid` 参数指定，其可能的取值及含义如下
+
+| pid 参数 | 含义                                                         |
+| -------- | ------------------------------------------------------------ |
+| pid > 0  | 信号发送给 PID 为 pid 的进程                                 |
+| pid = 0  | 信号发送给本地进程组内的其他进程                             |
+| pid = -1 | 信号发送给除 init 进程外的所有进程，但发送者需要拥有对目标进程发送信号的权限 |
+| pid < -1 | 信号发送给组 ID 为 -pid 的进程族中的所有成员                 |
+
+`Linux` 定义的信号值都大于 0 .如果 `sig` 取值为 0， 则 `kill` 函数不发送任何信号。
+
+### 10.1.2 信号处理方式
+
+目标进程在收到信号时，需要定义一个接收函数来处理，原型如下：
+
+```cpp
+#include <bits/signum.h>
+#define SIG_DEF ((__sighandler_t) 0)
+#define SIG_IGN ((__sighandler_t) 1)
+```
+
+- SIG_IGN 表示忽略目标的信号
+
+- SIG_DEF 表示使用信号的默认处理方式。
+
+  信号的默认处理方式有如下几种：
+
+  - 结束进程 ( Term )
+  - 忽略信号 ( Ign )
+  - 结束进程并生成核心转储文件 ( Core )
+  - 暂停进程 ( Stop )
+  - 继续进程 ( Cont )
+
+### 10.1.3  Linux 信号
+
+`Linux` 的可用信号都定义在 `bits/signum.h` 头文件中。
+
+重点的几个信号
+
+| 信号    | 起源    | 默认行为 | 含义                                         |
+| ------- | ------- | -------- | -------------------------------------------- |
+| SIGHUP  | POSIX   | Term     | 控制终端挂起                                 |
+| SIGPIPE | POSIX   | Term     | 往读端被关闭的管道或者 socket 连接中写数据   |
+| SIGURG  | 4.2 BSD | Ign      | socket 连接上接收到紧急数据                  |
+| SIGALRM | POSIX   | Term     | 由 alarm 或 setitimer 设置的实时闹钟超时引起 |
+| SIGCHLD | POSIX   | Ign      | 子进程状态发生变化 ( 退出或者暂停 )          |
+
+### 10.1.4 中断系统调用
+
+如果程序在执行处于阻塞状态的系统调用时接收到信号，并且我们为该信号设置了信号处理函数，则默认情况下系统调用将被中断，并且 `errno` 被色织为 `EINTR`。我们可以使用 `sigaction` 函数为信号设置 `SA_RESTART` 标志以自动重启被该信号中断的系统调用
+
+对于默认欣慰时暂停进程的信号，如果我们没有为他们设置信号处理函数，则也可以中断某些系统调用( connect、epoll_wait )。
+
+## 10.2 信号函数
+
+### 10.2.1  signal 系统调用
+
+要为一个信号设置处理函数，可以使用下面的 `signal` 系统调用：
+
+```cpp
+#include <signal.h>
+_sighandler_t signal ( int sig, _sighandler_t _handler )
+```
+
+- `sig` 指出要捕获的信号类型。
+- `_handler` `_sighandler_t` 类型的函数指针，用于指定信号 `sig` 的处理函数
+
+`signal` 函数成功时返回一个函数指针，和第二个参数类型一样。这个返回值是前一次调用 `signal` 函数时传入的函数指针，或者时信号 `sig` 对应的默认处理函数指针 `SIG_DEF` ( 如果时第一次调用 `signal` 的话 )
+
+`signal` 系统调用出错时返回 `SIG_ERR`
+
+### 10.2.2 sigaction 系统调用
+
+设置信号处理函数的更见状的接口是如下的系统调用：
+
+```cpp
+#inclide <signal.h>
+int sigaction( int sig, const struct sigaction* act, struct sigaction* oact );
+```
+
+- `sig` 指出要捕获的信号类型
+- `act` 指定新的信号处理防守
+- `oact` 输出信号先前的处理方式 ( 如果不为 NULL )
+
+`sigaction` 结构体描述了信号处理的细节，定义如下：
+
+```cpp
+struct sigaction
+{
+#ifdef __USE_POSIX199309
+    union
+    {
+        _sighandler_t sa_handler;
+        void (*sa_sigaction) ( int, siginfo_t*,  void* );
+    }
+    __sigaction_handler;
+#define sa_handler        __sigaction_handler.sa_handler
+#define sa_sigaction      __sigaction_handler.sa_sigaction
+#else
+    _sighandler_t sa_handler;
+#endif
+    _sigset_t sa_mask;
+    int sa_flags;
+    void (*sa_restorer) (void);
+};
+```
+
+- `sa_hander` 成员指定信号处理函数
+
+- `sa_mask` 成员设置进程的信号掩码，以指定哪些喜好不能发送给本进程
+
+  `sa_mask` 是信号集 `sigset_t` 类型，该类型指定一组信号。
+
+## 10.3 信号集
+
+### 10.3.1 信号集函数
+
+数据结构 `sigset_t` 定义如下：
+
+```cpp
+#include <bits/sigset.h>
+#define _SIGSET_NWORDS (1024 / (8 * sizeof (unsigned long int)))
+typedef struct{
+    unsigned long int __val[_SIGSET_NWORDS];
+} __sigset_t;
+```
+
+`Linux` 提供了如下一组函数来设置、修改、删除和查询信号集
+
+```cpp
+#include <signal.h>
+int sigemptyset (sigset_t* _set)                                   /* 清空信号集 */
+int sigfillset (sigset_t* _set)                                    /* 在信号集中设置所有信号 */
+int sigaddset (sigset_t* _set, int _signo)                         /* 将信号 _signo 添加至信号集中*/
+int sigdelset (sigset_t* _set, int _signo)                         /* 将信号 _signo 从信号集中删除 */
+int sigismember (_const sigset_t* _set, int _signo)                /* 测试 _signo 是否在信号集中 */
+```
+
+### 10.3.2 进程信号掩码
+
+我们可以利用 `sigaction` 结构体的 `sa_mask` 成员来设置进程的信号掩码。此外，如下函数也可以用于设置或查看进程的信号掩码
+
+```cpp
+#include <signal.h>
+int sigprocmask( int _how, _const sigset_t* _set, sigset_t* _oset )
+```
+
+- `_set` 指定新的信号掩码
+- `_oset` 输出原来的信号掩码
+
+如果 `set` 不为 `NULL`, 则 `_how` 指定进程信号的掩码方式，可选值如表
+
+| _how 参数   | 含义                                                         |
+| ----------- | ------------------------------------------------------------ |
+| SIG_BLOCK   | 新的进程信号掩码是其当前值和 _set 指定信号集的并集           |
+| SIG_UNBLOCK | 新的进程信号掩码是其当前值和 ~_set 信号集的交集，因此 _set 指定的信号集将不屏蔽 |
+| SIG_SETMASK | 直接将进程信号掩码设置为 _set                                |
+
+如果 `set` 为 `NULL`, 则进程信号掩码不变，此时我们仍然可以利用 `_oset` 参数来获得进程当前的信号掩码
+
+### 10.3.3 被挂起的信号
+
+设置进程信号掩码后，被屏蔽的信号将不能被进程接收。否则操作系统将该信号设置为进程的一个被挂起的信号。如果取消对被挂起信号的屏蔽，则能立即被进程接收到。如下函数可以获得进程当前被挂起的信号集
+
+```cpp
+#include <signal.h>
+int sigpending( sigset_t* set );
+```
+
+- `set` 保存被挂起的信号集。
+
+在多进程、多线程环境中，要以进程、线程为单位来处理信号和信号掩码。不能设想新创建的进程、线程具有和父进程、主线程完全相同的信号特征。比如 `fork` 调用产生的子进程能继承父进程的信号掩码，但具有一个空的挂起信号集。
+
+## 10.4 同一事件源
