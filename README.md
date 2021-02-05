@@ -454,7 +454,7 @@ STATE_MACHINE( Package _pack ){
 
 - parse_line 函数，从`buffer`中解析出一个行。如图
 
-  ![AC65A47DD17B74D3154F609F7B1B17E3](image/AC65A47DD17B74D3154F609F7B1B17E3-1611145451561.png)
+  ![image-20210205160742302](image/image-20210205160742302.png)
 
 这个状态机的初始状态是 `LINE_OK`， 其原始驱动力来自于 `buffer` 中新到达的客户数据。在`mian`函数中，我们循环调用`recv`函数往`buffer`中读入客户数据。每次成功读取数据后，我们就调用`parse_content`函数来分析新读入的数据
 
@@ -1043,5 +1043,312 @@ int sigpending( sigset_t* set );
 在多进程、多线程环境中，要以进程、线程为单位来处理信号和信号掩码。不能设想新创建的进程、线程具有和父进程、主线程完全相同的信号特征。比如 `fork` 调用产生的子进程能继承父进程的信号掩码，但具有一个空的挂起信号集。
 
 ## 10.4 同一事件源
+信号是一种异步事件，信号处理函数和程序的主循环是两条不同的执行路线。为了信号不被屏蔽太久，信号处理函数需要尽快执行完成(为了避免一些竞态条件，信号在处理期间，系统不会再次触发它)
 
-![image-20210202200847293](image/image-20210202200847293.png)
+> 竞态条件（Race Condition）：计算的正确性取决于多个线程的交替执行时序时，就会发生竞态条件。
+>
+> 最常见的竞态条件为：
+>
+> **先检测后执行。**
+>
+> > 执行依赖于检测的结果，而检测结果依赖于多个线程的执行时序，而多个线程的执行时序通常情况下是不固定、不可判断的，从而导致执行结果出现各种问题。
+
+一种典型的解决方案是：把信号的主要处理逻辑放到程序的主循环中，当信号处理函数被触发时，它只是简单地通知主循环程序接收到信号，并把信号值传递给主循环，主循环再根据接收到地信号值执行目标信号对应的逻辑代码。信号处理函数通常使用管道读出该信号值。那么主循环怎么知道管道上何时有数据可读？-- 使用 I/O 复用系统调用来监听管道的读端文件描述符上的可读事件。
+
+**event.cpp**
+
+## 10.5 网络编程相关信号
+
+### 10.5.1 SIGHUP
+
+该信号在挂起进程的控制终端时被触发。而对于没有控制终端的网络后台程序，它们通常利用 `SIGHUP` 信号来强制服务器重读配置文件。
+
+`xinetd` 程序在收到该信号后调用 `hard_reconfig` 函数。若某个正在运行的子服务的配置文件被修改以停止服务，则 `xinetd` 主进程将给该子服务进程发送 `SIGTERM` 信号以结束它。
+
+### 10.5.2 SIGPIPE
+
+默认情况下，往一个读端关闭的管道或 `socket` 连接中写数据将引发 `SIGPIPE` 信号。我们需要捕获并处理该信号，或者至少忽略它，因为程序接收到 `SIGPIPE` 信号的默认行为时结束进程。引起 `SIGPIPE` 信号的写操作将设置 `errno` 为 `EPIPE`
+
+我们可以使用 `send` 函数的 `MSG_NOSIGNAL` 标志来禁止写操作触发 `SIGPIPE` 信号。在这种情况下，我们应使用 `send` 函数反馈的 `errno` 值来判断管道或者 `socket` 连接的读端是否已经关闭
+
+我们也可以用 I/O 复用系统调用来检测管道和 `socket` 连接的读端是否关闭。以 `poll` 为例，当管道的读端关闭时，写端文件描述符上的 `POLLHUP` 事件将被触发；当 `socket` 连接被对方关闭时，`socket` 上的 `POLLRDHUP` 事件将被触发
+
+### 10.5.3 SIGURG
+
+在 `Linux` 环境下，内核通知应用程序带外数据到达主要有两种方法：
+
+- I/O 复用计数， `select` 等系统调用在接收到带外数据时将返回，并向应用程序报告 `socket` 上的异常事件
+
+  - **select.c** 第九章
+
+- 使用 `SIGURG` 信号
+
+  `SIGURG.cpp`
+
+  可以通过第五章的 `client.c` 程序发送数据查看如何处理
+
+![在这里插入图片描述](https://img-blog.csdnimg.cn/20210202200816783.png)
+
+# 第13章 多进程编程
+
+本章主要讨论如下内容：
+
+- 复制进程映像的 `fork` 系统调用和替换进程映像的 `exec` 系列系统调用
+- 僵尸进程以及如何避免僵尸进程
+- 进程间通信 ( Inter-Process Communication, IPC ) 最简单的方式：管道
+- 3 中 System V 进程间通信方式：信号量、消息队列和共享内存。它们都是由 AT&T System V2 版本的 UNIX 引入的，所有同城为 System V IPC
+- 在进程间传递文件描述符的通用方法：通过 UNIX 本地域 socket 传递特殊的辅助数据
+
+## 13.1 fork 系统调用
+
+`Linux` 下创建新进程的系统调用是 `fork`。定义如下：
+
+```c
+#include <sys/types.h>
+#include <unistd.h>
+pid_t fork( void );
+```
+
+该函数的每次调用都返回两次，在父进程中返回的是子进程的 PID，在子进程中则返回 0。该返回值是后续代码判断当前进程是父进程还是子进程的依据。
+
+`fork` 函数赋值当前进程，在内核进程表中创建一个新的进程表项。新的进程标像有很多属性和原进程相同，比如堆指针、栈指针和标志寄存器的值。但也有许多属性被赋予了新的值，比如该进程的 `PPID` 被设置成原进程的 `PID`, 信号位图被清除( 原进程设置的信号处理函数不再对新进程起作用 )
+
+子进程的代码与父进程完全相同，同时它还会赋值父进程的数据 ( 堆数据、栈数据和静态数据 )。数据的赋值采用的是所谓的写时复制（ copy on writte ），即只有在任一进程( 父进程或子进程 ) 对数据执行的写操作时，复制才会发生(先是缺页中断，然后操作哦系统给子进程分配内存并复制父进程的数据)。即使如此，如果我们在程序中分配了大量内存，那么使用 `fork` 时也应当十分谨慎，尽量避免没有毕要的内存分配和数据复制。
+
+此外，创建子进程后，父进程中打开的文件描述符默认在子进程中也是打开的。且文件描述符的引用计数 +1 。不仅如此，父进程的用户根目录、当前工作目录等变量的引用计数均会 +1；
+
+测试：
+
+```c
+#include <sys/types.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+using namespace std;
+
+int main(){
+    int a = 10;
+    printf("%d ", &a);
+    printf("%d ", a);
+    fork();
+    a += 1;
+    printf("%d ", &a);
+    printf("%d ", a);
+
+    return 0;
+}
+/*
+-1425197020 10 -1425197020 11 -1425197020 10 -1425197020 11
+*/
+```
+
+写时复制，但是这里打印出来的地址是一样的，经过查阅，这里的地址应该是操作系统给我们的虚拟地址，实际应该有两个真实的物理地址。只是在这两个进程切换过程中，两个物理地址都映射到了这个给出的虚拟地址。
+
+## 13.2 exec 系列系统调用
+
+有时需要在子进程中执行其他程序，即替换当前进程映像，这就需要使用如下 `exec` 系列函数之一：
+
+```c
+#include <unistd.h>
+extern char** environ;
+int execl( const char* path, const char* arg, ... );
+int execlp( const char* file, const cahr* arg, ... );
+int execle( const char* path, const char* arg, ..., char* const envp[] );
+int execv( const char* path, char* const argv[] );
+int execvp( const char* file, char* const argv[] );
+int execve( const char* path, char* const argv[], char* const envp[] );
+```
+
+- path 指定可执行文件的完整路径
+- file 可以接收文件名，该文件的距离位置则在环境变量 PATH 中搜寻。
+- arg 接收可变参数
+- argv 接收参数数组，和上一个参数都会被传递给新程序( path 或 file 指定的程序) 的 main 函数
+- envp 用于设置新程序的环境变量。如果未设置它，则新程序将使用由全局变量 `environ` 指定的环境变量
+
+一般情况下，`exec` 函数是不返回的，除非出错，出错时返回 -1，并设置 `errno`。如果没出错，则源程序中 exec 调用之后的代码都不会执行，因为此时源程序已经被 `exec` 的参数指定的程序完全替换
+
+`exec` 函数不会关闭源程序打开的文件描述符，除非该文件描述符被设置了类似 `SOCK_CLOEXEC` 的属性 (`int socket( int domain, int type, int protocol)` 里的 type 参数就可以设置)
+
+## 13.3 处理僵尸进程
+
+对应多进程程序而言，父进程一般需要跟粽子进程的退出状态。因此，当子进程结束运行时，内核不会立即释放该进程的进程表表项，以满足父进程后续对该子进程退出信息的查询( 如果父进程还在运行 )。在子进程结束运行之后，父进程读取其退出状态之前，我们称该子进程处于僵尸态。另外一种使子进程进入僵尸态的情况是：父进程结束或者异常终止。而子进程继续运行。此时子进程的 `PPID` 将被操作系统设置为 1，即 `init` 进程。`init` 进程接管了该子进程，并等待它结束。在父进程退出之后，自己成退出之前，该子进程处于僵尸态
+
+由此，如果父进程没有正确地处理子进程的返回信息，子进程都将停留在僵尸态，并占据着内核资源。而着绝对不被允许，因为内核资源有限。下面这对函数在父进程中调用，以等待子进程的结束，并获取子进程的返回信息，从而避免了僵尸进程的产生，或者使子进程的僵尸态立即结束
+
+```cpp
+#include <sys/types.h>
+#include <sys/wait.h>
+pid_t wait( int* stat_loc );
+pid_t waitpid( pid_t pid, int* stat_loc, int options );
+```
+
+`wait` 函数将阻塞进程，知道该进程的某个子进程结束运行为止。它返回结束运行的子进程的 `PID`，并将该子进程的退出状态信息存储于  `stat_loc` 参数指向的内存中。 `sys/wait.h` 头文件中定义了几个宏来帮助解释子进程的退出状态信息，如表
+
+| 宏                      | 含义                                                        |
+| ----------------------- | ----------------------------------------------------------- |
+| WIFEXITED( stat_val )   | 如果子进程正常结束，它就返回一个非 0 值                     |
+| WEXITSTATUS( stat_val ) | 如果 WIFEXITED 非 0 ，它返回子进程的退出码                  |
+| WIFSIGNALED( stat_val ) | 如果子进程是因为一个未捕获的信号而重指，它就返回一个非 0 值 |
+| WTERMSIG( stat_val )    | 如果 WIFSIGNALED 非 0 ，它返回一个信号值                    |
+| WIFSTOPPED( stat_val )  | 如果子进程意外终止，它就返回一个 非 0 值                    |
+| WSTOPSIG( stat_val )    | 如果 WIFSTOPPED 非 0，它返回一个信号值                      |
+
+`wait` 函数的阻塞特性被 `waitpid` 函数解决了。`waitpid` 只等待由 `pid` 参数指定的子进程。如果 `pid` 取值为 -1，那么它就和 `wait` 含义相同，即等待任意一个子进程结束。`stat_loc` 参数含义与 `wait` 相同。`option` 参数可以控制 `waitpid` 函数行为。常用取值是 `WNOHANG`。当 `option` 的取值是 `WNOHANG` 时，`waitpid` 调用将是非阻塞的；如果 `pid` 指定的目标子进程还没有结束或意外终止，则 `waitpid` 立即返回 0；如果目标子进程确实正常退出了，则 `waitpid` 返回该进程的 `PID`。`waitpid` 调用失败时返回 -1 并设置 `errno`。
+
+对于 `waitpid` 函数而言，最好在某个子进程退出之后再调用它。而父进程从何得知子进程已经退出了呢？ `SIGCHLD` 信号。我们再父进程中捕获 `SIGCHLD` 信号，并在信号处理函数中调用 `waitpid` 函数以“彻底结束”一个子进程。
+
+```cpp
+static void handle_child( int sig ){
+    pid_t pid;
+    int stat;
+    while( ( pid == waitpid( -1, &stat, WNOHANG ) ) > 0 ){
+		/* 对结束进程进行善后处理 */
+    }
+}
+```
+
+## 13.4 管道
+
+管道能在父、子进程间传递数据，利用的是 `fork` 调用之后两个管道文件描述符 ( fd[0] 和 fd[1] ，参考 pipe ), 都保持打开。一堆这样的文件描述符只能保证父、子进程间一个方向的数据传输，父进程和子进程必须有一个关闭 `fd[0]`，另一个关闭 `fd[1]` 。要实现从父进程像子进程写数据，如果所示。
+
+![AF362DCDA8478162CC906BFB3DE5C8E2](image/AF362DCDA8478162CC906BFB3DE5C8E2.png)
+
+显然，如果要实现双向数据传输，需使用两个管道。`socket` 编程接口提供了一个创建全双工管道的系统调用：`socketpair`。`squid` 服务器程序就是利用 `socketpair` 创建管道，以实现再父进程和日志服务子进程之间传递日志信息。
+
+管道只能用于有关联的两个进程( 比如父、子进程 )间的通信。而`System V IPC`能用于无关联的多个进程之间的通信，因为它们都是用一个全局唯一的键值来标识一条信道。
+
+## 13.5 信号量
+
+### 13.5.1 信号量原语
+
+当多个进程同时访问系统某个资源时，就需要考虑进程的同步问题，以确保任一时刻只有一个进程可以拥有对资源的独占式访问。通常，程序中对共享资源访问的那段代码被称为关键代码段，或者临界区。
+
+信号量是一种特殊的变量，只能取自然数值并且只支持两种操作：等待(wait)和信号(signal)。这两种操作更常用的称呼是 P、V 操作。假设信号量 SV，则对它的 P、V操作含义如下：
+
+- P(SV)，如果 SV 的值大于 0，就将它减 1；如果 SV 的值为 0，则挂起进程的执行
+- V(SV)，如果有其他进程因为等待 SV 而挂起，则唤醒；如果没有，则将 SV 加 1；
+
+`Linux` 信号量的 `API` 都定义在 `sys/sem.h` 头文件中，主要包含 3 个系统调用：`semget、semop` 和 `semctl`。它们都被设计为操作一组信号量，即信号集，而不是单个信号量。
+
+### 13.5.2 semget 系统调用
+
+该调用创建一个新的信号量集，或者获取一个已经存在的信号集量。定义如下：
+
+```cpp
+#include <sys/sem.h>
+int semget( key_t key, int num_sems, int sem_flags );
+```
+
+- key 键值，标识一个全局唯一的信号量集，就行文件名全局唯一地标识一个文件一样。要通过信号量通信地进程需要使用相同的剑指来创建 / 获取信号量
+- num_sems 指定要创建 / 获取的信号量集中信号量的数目。如果是创建信号量，则该值必须被指定；如果是获取已经存在的信号量，则可以把它设置为 0
+- sem_flags 指定一组标志。它低端的 9 个比特是该信号量的权限，其格式和含义都与系统调用 `open` 的 `mode` 参数相同
+
+如果 `semget` 用于创建信号量集，则与之管理的内核数据结构体 `semid_ds` 将被创建并初始化。`semid_ds` 结构体定义如下：
+
+```cpp
+#include <sys/sem.h>
+/* 该结构体用于描述 IPC 对象 ( 信号量、共享内存和消息队列 ) 的权限 */
+struct ipc_perm{
+    key_t key;                            /* 键值 */
+    uid_t uid;                            /* 所有者的有效用户 ID */
+    gid_t gid;                            /* 所有者的有效组 ID */
+    uid_t cuid;                           /* 创建者的有效用户 ID */
+    gid_t cgid;                           /* 创建者的有效组 ID */
+    mode_t mode;                          /* 访问权限 */
+    /* 其他填充字段 */
+}
+struct semid_ds{
+    struct ipc_perm sem_perm;              /* 信号量的操作权限 */
+    unsigned long int sem_nsems;           /* 该信号量集中的信号量数目 */
+    time_t sem_otime;                      /* 最后一次调用 semop 的时间 */
+    time_t sem_ctime;                      /* 最后一次调用 semctl 的时间 */
+	/* 其他填充字段 */
+}
+```
+
+`semget` 对 `semid_ds` 结构体的初始化包括：
+
+- 将 `sem_perm.cuid` 和 `sem_perm.uid` 设置为调用进程的有效用户 ID
+- 将 `sem_perm.cgid` 和 `sem_perm.gid` 设置为调用进程的有效组 ID
+- 将 `sem_perm.mode` 的最低 9 为设置为 `sem_flags` 参数的最低 9 位
+- 将 `sem_nsems` 设置为 `num_sems`
+- 将 `sem_otime` 设置为 0
+- 将 `sem_ctime` 设置为当前的系统时间
+
+### 13.5.3 semop 系统调用
+
+`semop` 系统调用改变信号量的值，即执行 P、V 操作。以下是与每个信号量关联的一些重要的内核变量：
+
+```cpp
+unsigned short semval;                          /* 信号量的值 */
+unsigned short semzcnt;                         /* 等待信号量值变为 0 的进程数量 */
+unsigned short semncnt;                         /* 等待信号量值增加的进程数量 */
+pid_t sempid;                                   /* 最后一次执行 semop 操作的进程 ID */
+```
+
+`semop` 对信号量的操作实际上就是对这些内核变量的操作。定义如下
+
+```cpp
+#include <sys/sem.h>
+int semop( int sem_id, struct sembuf* sem_ops, size_t num_sem_ops );
+```
+
+- `sem_id` 由 `semget` 调用返回的信号量集标识符，用以指定被操作的目标信号量集。
+
+- `sem_ops` 指向一个 `sembuf` 结构体类型的数组，定义如下
+
+  ```cpp
+  struct sembuf{
+      unsigned short int sem_num;
+      short int sem_op;
+      short int sem_flg;
+  }
+  ```
+
+  - sem_num 成员是信号量集中信号量的编号， 0 标识信号量集中的第一个信号量。
+  - sem_op 指定操作类型，其可选值为正整数、0、负整数。每种类型的行为又收到 `sem_flg` 成员的影响
+  - sem_flg 可选值的 `IPC_NOWAIT` 和 `SEM_UNDO`。前者的含义是，无论信号量操作是否成功，`semop` 的调用都立即返回，类似于非阻塞 I/O 操作。后者的含义是，当进程退出时取消正在进行的 `semop` 操作。
+
+`semop` 系统调用的第三个参数 `num_sem_ops` 指定要执行的操作个数，即 `sem_ops` 数组中元素的个数。`semop` 对数组 `sem_ops` 中的每个成员按照数组顺序依次执行操作，并且该过程是原子操作，以避免别的进程在同一时间按照不同的顺序对该信号集中的信号量执行 `semop` 操作导致的竞态条件
+
+`semop` 成功时返回 0，失败则返回 -1 并设置 `errno`。失败的时候，`sem_ops` 数组中指定的所有操作都不被执行
+
+### 13.5.4 semctl 系统调用
+
+`semctl`系统调用允许调用者对信号量进行直接控制。定义如下
+
+```cpp
+#include <sys/sem.h>
+int semctl( int sem_id, int sem_num, int command, ... );
+```
+
+- sem_id 由 `semget` 调用返回的信号量集标识符，用以指定被操作的信号量集。
+- sem_num 指定被操作的信号量在信号量集中的编号
+- command 指定要执行的命令
+
+有的命令需要调用者传递第 4 个参数。第 4 个参数由我们用户自己定义，`sys/sem.h` 头文件给出了它的推荐格式
+
+```cpp
+union semun{
+    int val;                           /* 用于 SETVAL 命令 */
+    struct semid_ds* buf;              /* 用于 IPC_STAT 和 IPC_SET 命令 */
+    unsigned short* array;             /* 用于 GETALL 和 SETALL 命令 */
+    struct seminfo* __buf;             /* 用于 IPC_INFO 命令 */
+};
+struct seminfo{
+    int semmap;                        /* Linux 内核没有使用 */
+    int semmni;                        /* 系统最多可以拥有的信号量集数目 */
+    int semmns;                        /* 系统最多可以拥有的信号量数目 */
+    int semmnu;                        /* Linux 内核没有使用 */
+    int semmsl;                        /* 一个信号量集最多允许包含的信号量数目 */
+    int semopm;                        /* semop 一次最多能执行的 sem_op 操作数目 */
+    int semume;                        /* Linux 内核没有使用 */
+    int semusz;                        /* sem_undo 结构体的大小 */
+    int semvmx;                        /* 最大允许的信号量值 */
+    /* 最多允许的 UNDO 次数 ( 带 SEM_UNDO 标志的 semop 操作的次数 ) */
+    int semaem;
+};
+```
+
+### 13.5.5 特殊键值 IPC_PRIVATE
+
