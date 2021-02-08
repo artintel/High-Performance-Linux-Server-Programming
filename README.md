@@ -1352,3 +1352,152 @@ struct seminfo{
 
 ### 13.5.5 特殊键值 IPC_PRIVATE
 
+`semget` 的调用者可以给其 `key` 参数传递一个特殊的键值 `IPC_PRIVATE` （ 其值为 0 ），这样无论该信号量是否已经存在，`semget` 都将创建一个新的信号量。使用该键值创建的信号量并非像其名称声明的那样时进程私有的。其他进程，尤其是子进程，也有方法来访问这个信号量。所以应该称为 `IPC_NEW`。
+
+**IPC_PRIVATE.c**
+
+该代码在父、子进程间使用一个 `IPC_PRIVATE` 信号来同步。
+
+另：工作在 `prefork` 模式下的 `httpd` 网页服务器程序使用 1 个 `PRIVATE` 信号量来同步各子进程对 `epoll_wait` 的调用权。
+
+还有两种 `IPC` -- 共享内存和消息队列。这两种 IPC 在创建资源得时候也支持 `IPC_PRIVATE` 键值，其含义和信号量的  `IPC_PRIVATE` 键值相同
+
+## 13.6 共享内存
+
+共享内存是最高效的 `IPC` 机制，因为它不涉及进程之间的任何数据传输。这种高效率所带来的问题是我们必须用其他的辅助手段来同步进程对共享内存的访问，否则会产生竞态条件。因此，共享内存通常和其他进程间通信方式一起使用
+
+`Linux` 共享内存的 `API` 定义在 `sys/shm.h` 头文件中，包括四个系统调用：`shmget、shmat、shmdt` 和 `shmctl`。
+
+### 13.6.1 shmget 系统调用
+
+创建一段新的共享内存，或者获取已经存在的共享内存。定义如下
+
+```c
+#include <sys/shm.h>
+int shmget( key_t key, size_t size, int shmflg );
+```
+
+和 `semget` 系统调用一样，`key` 参数是一个键值，用来标识一段全局唯一的共享内存。`size` 参数指定共享内存的大小，单位是字节。如果是创建新的共享内存，则 `size` 值必须被指定。如果是获取已经存在的共享内存，则可以把 `size` 设置为 0 .
+
+- shmflg 和 `sem_flags` 参数相同，不过 `shmget` 支持两个额外的标志 -- `SHM_HUGETLB` 和 `SHM_NORESERVE`
+  - SHM_HUGETLB 类似于 `mmap` 的 `MAP_HUGETLB` 标志，系统将使用 “大页面” 来为共享内存分配空间
+  - SHM_NORESERVE 类似于 `mmap` 的 `MAP_NORESERVE` 标志，不为共享内存保存交换分区 ( swap 空间 )。这样，当物理内存不足时，对该共享内存执行写操作将触发 SIGSEGV 信号
+
+`shmget` 成功时返回一个正整数值，它是共享内存的标识符。失败时返回 -1，并设置 `errno`
+
+如果 `shmget` 用于创建共享内存，则这段共享内存的所有字节都被初始化为 0，与之关联的内核数据结构 `shmid_ds` 将被创建并初始化。`shmid_ds` 结构体的定义如下
+
+```c
+struct shmid_ds{
+    struct ipc_perm shm_perm;                        /* 共享内存的操作权限 */
+    size_t shm_segsz;                                /* 共享内存大小，单位是字节 */
+    __time_t shm_atime;                              /* 对这段内存最后一次调用 shmat 的时间 */
+    __time_t shm_dtime;                              /* 对这段内存最后一次调用 shmdt 的时间 */
+    __time_t shm_ctime;                              /* 对这段内存最后一次调用 shmctl 的时间 */
+    __pid_t shm_cpid;                                /* 创建者的 PID */
+    __pid_t shm_lpid;                                /* 最后一次执行 shmat 或 shmdt 操作的进程 */
+    shmatt_t shmnattach;                             /* 目前关联到此共享内存的进程数量 */
+    /* 其他填充字段 */
+};
+```
+
+`shmget` 对 `shmid_ds` 结构体的初始化包括：
+
+- 将 `shm_perm.cuid` 和 `shm_perm.uid` 设置为调用进程的有效用户 ID
+- 将 `shm_perm.cgid` 和 `shm_perm.gid` 设置为调用进程的有效组 ID
+- 将 `shm_perm.mode` 的最低 9 位设置为 `shmflg` 参数的最低 9 位
+- 将 `shm_segsz` 设置为 `size`
+- 将 `shm_lpid、shm_nattach、shm_atime、shm_dtime` 设置为 0
+- 将 `shm_ctime` 设置为当前的时间
+
+### 13.6.2 shmat 和 shmdt 系统调用
+
+共享内存被创建 / 获取之后，我们不能立即访问它，而是需要先将它关联到进程的地址空间中。使用完共享内存之后，我们也需要将它从进程地址空间中分离。分别由如下两个系统调用实现
+
+```c
+#include <sys/shm.h>
+void* shmat( int shm_id, const void* shm_addr, int shmflg );
+int shmdt( const void* shm_addr );
+```
+
+- shm_id 由 `shmget` 调用返回的共享内存标识符
+- shm_addr 指定将共享内存关联到进程的哪块地址空间，最终的效果还收到 `shmflg` 参数的可选标志 `SHM_RND` 的影响
+
+shmat 成功时返回共享内存被关联到的地址，失败则返回 (void*)-1 并设置 `errno`。shmat 成功时，将修改内核数据结构`shmid_ds`的部分字段
+
+- 将 `shm_nattach` 加 1
+- 将 `shm_lpid` 设置为调用进程的 `PID`
+- 将 `shm_atime` 设置为当前的时间
+
+shmdt 将关联到 `shm_addr` 处的共享内存从进程中分离。它成功时返回 0，失败则返回 -1 并设置 `errno`。`shmde` 在成功调用时将修改内核数据结构 `shmid_ds` 的部分字段
+
+- 将 `shm_nattach` 减 1
+- 将 `shm_lpid` 设置为调用进程的 `PID`
+- 将 `shm_dtime` 设置为当前的时间
+
+### 13.6.3 shmctl 系统调用
+
+`shmctl` 系统调用控制共享内存的某些属性，定义如下
+
+```c
+#include<sys/shm.h>
+int shmctl( int shm_id, int command, struct shmid_ds* buf );
+```
+
+- shm_id 由 `shmget` 调用返回的共享内存标志
+- command 指定要执行的命令
+
+`shmctl` 支持的命令如下
+
+| 命令       | 含义                                                         | shmctl 成功时的返回值                                       |
+| ---------- | ------------------------------------------------------------ | ----------------------------------------------------------- |
+| IPC_STAT   | 将共享内存相关的内核数据结构复制到 buf 中                    | 0                                                           |
+| IPC_SET    | 将 buf 中的部分成员复制到共享内存相关的内核数据结构中，同时内核数据中的 `shmid_ds.shm_ctime` 更新 | 0                                                           |
+| IPC_RMID   | 将共享内存打上删除的标记。这样当最后一个使用它的进程调用 `shmdt` 将它从进程中分离时，该共享内存就被删除了 | 0                                                           |
+| IPC_INFO   | 获取系统共享内存资源配置信息，将结果存储在 buf 中。应用程序需要将 buf 装换成 `shminfo` 结构体类型来读取这些系统信息。`shminfo` 结构体与 `seminfo` 类似。 | 内存共享内存信息数组中已经被使用的项的最大索引值            |
+| SHM_INFO   | 与 `IPC_INFO` 类似，不过返回的是已经分配的共享内存占用的资源信息。应用程序需要将 buf 转换成 `shm_info` 结构体类型来读取这些信息。`shm_info` 和 `shminfo` 类似 | 同 `IPC_INFO`                                               |
+| SHM_STAT   | 与 `IPC_STAT` 类似，不过此时 `shm_id` 参数不是用来标识共享内存标识符，而是内核中共享内存信息数组的索引(每个共享内存的信息都是该数组中的一项) | 内核共享内存信息数组中索引值为  `shm_id` 的共享内存的标识符 |
+| SHM_LOCK   | 禁止共享内存被移动至交换分区                                 | 0                                                           |
+| SHM_UNLOCK | 允许共享内存被移动至交换分区                                 | 0                                                           |
+
+`shmctl`成功时的返回值取决于 `command` 参数。失败时返回 -1, 并设置 `errno`
+
+### 13.6.4 共享内存的 POSIX 方法
+
+无须任何文件的支持，通过利用 `mmap` 在无关进程之间共享内存。需先使用如下函数来创建或打开一个 `POSIX` 共享内存对象
+
+```c
+#include <sys/man.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+int shm_open( const char* name, int oflag, mode_t mode );
+```
+
+`shm_open` 的使用方法与 `open` 系统调用完全相同
+
+- name 指定要创建 / 打开的共享内存对象。从可移植性的角度考虑，该参数应该使用 “/somename” 的格式：以 "/" 开始，后接多个字符，且这些字符都不是 "/"; 以 "\0" 结尾，长度不超过 `NAME_MAX` ( 通常是 255 )
+
+- oflag 指定创建方式。它可以是下列标志中的一个或者多个的按位或
+
+  - O_RDONLY 以制度方式打开共享内存对象
+  - O_RDWR 以可读、可写方式打开共享内存对象
+  - O_CREAT 如果共享内存对象不存在，则创建之。此时 `mode` 参数的最低 9 位将指定该共享内存对象的访问权限。共享内存被创建时，其初始长度为 0
+  - O_EXCL 和 O_CREAT 一起使用，如果由 `name` 指定的共享内存对象已经存在，则 `shm_open` 调用返回错误，否则就创建一个新的共享内存对象
+  - O_TRUNC 如果共享内存对象已经存在，则把它截断，使其长度为 0
+
+  `shm_open` 调用成功返回一个文件描述符。该文件描述符可用于后续的 `mmap` 调用，从而将共享内存关联到进程
+
+  和打开的文件最后需要关闭一样，由 `shm_open` 创建的共享内存使用完之后也需要被删除。该过程通过如下函数实现
+
+  ```c
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <fcntl.h>
+  int shm_unlink( const char* name );
+  ```
+
+  该函数将 `name` 指定的共享内存对象标记为等待删除。当所有使用该共享内存对象的进程都是用 munmap 将它从进程中分离之后，系统将教会这个共享内存对象所占据的资源
+
+  如果代码中使用了上诉 `POSIX` 共享内存函数，则编译时需要指定连接选项 `-lrt`
+
+### 13.6.5 共享内存实例
