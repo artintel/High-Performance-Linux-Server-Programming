@@ -110,10 +110,12 @@ int run_child( int idx, client_data* users, char* share_mem ){
             printf( "epoll failure\n" );
             break;
         }
+        printf("number %d\n", number);
         for( int i = 0; i < number; i++ ){
             int sockfd = events[i].data.fd;
             /* 本子进程负责的客户连接有数据到达 */
             if( ( sockfd == connfd ) && ( events[i].events & EPOLLIN ) ){
+                printf("1\n");
                 memset( share_mem + idx * BUFFER_SIZE, '\0', BUFFER_SIZE );
                 /* 将客户数据读取到对应的读缓存中。该读缓存是共享内存的一段，它开始于 idx*BUFFER_SIZE处，
                 长度为 BUFFER_SIZE 字节。因此，各个客户连接的读缓存是共享的 */
@@ -133,6 +135,7 @@ int run_child( int idx, client_data* users, char* share_mem ){
             }
             /* 主进程通知本进程(通过管道)将第 client 个客户的数据发送到本进程负责的客户端 */
             else if( ( sockfd == pipefd ) && ( events[i].events & EPOLLIN ) ){
+                printf("2\n");
                 int client = 0;
                 /* 接收主进程发送来的数据，即有客户数据到达的连接的编号 */
                 ret = recv( sockfd, ( char* )&client, sizeof( client ), 0 );
@@ -188,10 +191,11 @@ int main( int argc, char* argv[] ){
     epollfd = epoll_create( 5 );
     assert( epollfd != -1 );
     addfd( epollfd, listenfd );
+
     ret = socketpair( PF_UNIX, SOCK_STREAM, 0, sig_pipefd );
     assert( ret != -1 );
     setnonblocking( sig_pipefd[1] );
-    setnonblocking( sig_pipefd[0] );
+    addfd( epollfd, sig_pipefd[0] );
 
     addsig( SIGCHLD, sig_handler );
     addsig( SIGTERM, sig_handler );
@@ -202,6 +206,11 @@ int main( int argc, char* argv[] ){
     /* 创建共享内存，作为所有客户 socket 连接的读缓存 */
     shmfd = shm_open( shm_name, O_CREAT | O_RDWR, 0666 );
     assert( shmfd != -1 );
+
+    /* !!! */
+    ret = ftruncate( shmfd, USER_LIMIT * BUFFER_SIZE );
+    assert( ret != -1 );
+
     share_mem = (char*)mmap( NULL, USER_LIMIT * BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, 
     shmfd, 0 );
     assert( share_mem != MAP_FAILED );

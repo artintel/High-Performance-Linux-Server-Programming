@@ -1518,3 +1518,189 @@ int shm_open( const char* name, int oflag, mode_t mode );
 `Linux` 消息队列 API 都定义在 `sys/msg.h` 头文件中，包括 4 个系统调用：`msgget、msgnd、msgrcv` 和 `msgctl`
 
 ### 13.7.1 msgget 系统调用
+
+`msgget` 系统调用创建一个消息队列，或者获取一个已有地消息队列。其定义如下：
+
+```cpp
+#include <sys/msg.h>
+int msgget( key_t key, int msgflg );
+```
+
+和 `semget` 系统调用一样， `key` 参数是一个键值，用来标识一个全局唯一地消息队列
+
+- msgflg 与 `semget` 系统调用地 `sem_flags` 参数相同
+
+成功时返回一个正整数数值，它时消息队列的标识符。
+
+如果用 `msgget` 创建消息队列，则与之关联的内核数据结构 `msgid_ds`将被创建并初始化。`msgid_ds` 结构体定义如下：
+
+```cpp
+struct msqid_ds{
+	struct ipc_perm msg_perm                      /* 消息队列的操作权限 */
+	time_t msg_stime;                             /* 最后一次调用 msgsnd 的时间 */
+	time_t msg_rtime;                             /* 最后一次调用 msgrcv 的时间 */
+	time_t msg_ctime;                             /* 最后一次被修改的时间 */
+	unsigned long __msg_cbytes;                   /* 消息队列中已有的字节数 */
+	msgqnum_t msg_qnum;                           /* 消息队列中已有的消息数 */
+	msglen_t msg_qbytes;                          /* 消息队列允许的最大字节数 */
+	pid_t msg_lsqid;                              /* 最后执行 msgsnd 进程的 PID */
+	pid_t msg_lrpid;                              /* 最后执行 msgrcv 的进程的 PID */
+};
+```
+
+### 13.7.2 msgsnd 系统调用
+
+该系统调用把一条消息添加到消息队列中。定义如下：
+
+```cpp
+#include <sys/msg.h>
+int msgsnd( int msqid, const void* msg_ptr, size_t msg_sz, int msgflg );
+```
+
+- msqid 由 `msgget` 调用返回的消息队列标识符
+
+- msg_ptr 指向一个准备发送的消息，消息必须被定义为如下类型
+
+  ```cpp
+  struct msgbuf{
+  	long mtype;        /* 消息类型 */
+  	char mtext[512];   /* 消息数据 */
+  };
+  ```
+
+  - mtype 指定消息的类型，必须是一个正整数。
+  - mtext 消息数据。
+
+- msg_sz 消息的数据部分(mtext)长度。0 表示没有消息数据
+
+- msgflg 控制 `msgsnd`行为。通常仅支持 `IPC_NOWAIT` 标志，即以非阻塞的方式发送消息。默认情况下，发送消息时如果消息队列满了，则 `msgsnd` 将阻塞。若 `IPC_NOWAIT` 标志被指定，则 `msgsnd` 将立即返回并这是 `errno` 为 `EAGAIN`
+
+处于阻塞状态的`msgsnd`调用可能被如下两种异常情况中断：
+
+- 消息队列被移除。此时 `msgsnd`调用将立即返回并设置 errno 为 EIDRM
+- 程序接收到信号。此时 `msgsnd`调用将立即返回并这是 errno 为 EINTR
+
+`msgsnd`成功时将修改内核数据结构 `msqid_ds`的部分字段
+
+- 将 `msg_qnum` 加 1
+- 将 `msg_lspid` 设置为调用进程的 `PID`
+- 将 `msg_stime` 设置为当前的时间
+
+### 13.7.3 msgrcv 系统调用
+
+该系统调用从消息队列中获取消息。定义如下：
+
+```cpp
+#include <sys/msg.h>
+int msgrcv( int msqid, void* msg_ptr, size_t msg_sz, long int msgtype, int msgflg );
+```
+
+- msqid 是由 `msgget`调用返回的消息队列标识符
+- msg_ptr 用于存储接收的信息
+- msg_sz 消息数据部分长度
+- msgtype 指定接收何种类型的消息
+  - msgtype == 0 读取消息队列中第一个消息
+  - msgtype > 0 读取消息队列中第一个类型为 `msgtype`的消息(除非指定了 MSG_EXCEPT)
+  - msgtype < 0 读取队列中第一个类型值比 `msgtype` 小的消息
+- msgflg 控制 msgrcv 函数的行为。可以是如下一些标志的按位或
+  - `IPC_NOWAIT` 如果没有消息，msgrcv 调用理解返回并设置 errno ENOMSG
+  - MSG_EXCEPT 如果 msgtype > 0，则接收消息队列中第一个非 `msgtype` 类型的消息
+  - MSG_NOERRBO 如果消息数据部分长度超过 `msg_sz`，截断
+  - 消息队列被移除。`msgrcv` 调用立即返回并设置 `errno` 为 `EIDRM`
+  - 程序接收到信号。立即返回并设置 errno 为 EINTR。
+
+`msgrcv`成功时将修改内核数据结构 `msqid_ds`的部分字段
+
+- 将 msg_qnum 减 1
+- 将 msg_lrpid 设置为调用进程的 ID
+- 将 msg_rtime 设置为当前的时间
+
+### 13.7.4 msgctl 系统调用
+
+控制消息队列的某些属性。定义如下：
+
+```cpp
+#include <sys/msg.h>
+int msgctl( int msqid, int command, struct msqid_ds* buf );
+```
+
+- msqid 是由 `msgget` 调用返回的共享内存标识符。
+- command 指定要执行的命令
+
+## 13.8 IPC 命令
+
+上诉三种信号量、消息队列和共享内存的 System V IPC 进程间通信方式都是使用一个全局唯一的键值(key)来描述一个共享资源。当程序调用 `semget、shmget` 或者 `msgget` 时，就创建了这些共享资源的一个实例。`Linux`提供了 ipcs 命令，以观察当前系统上拥有哪些共享资源实例。
+
+## 13.9 在进程间传递文件描述符
+
+由于 `fork` 调用之后，父进程中打开的文件描述符在子进程中仍然保持打开，所以文件描述符可以很方便地从父进程传递到子进程。需要注意地时，传递一个文件描述符并不是传递一个文件描述符的值。而是要在接收进程中创建一个新的文件描述符，并且该文件描述符和发送进程中被传递的文件描述符指向内核中相同的文件表项。
+
+在 `Linux` 下，我们利用 `UNIX` 域 `socket` 在进程间传递特殊的辅助数据，以实现文件描述符的传递，在两个不相干的进程间传递文件描述符。
+
+`transmit.cpp`
+
+描述符是通过结构体 msghdr 的 msg_control 成员送的，因此在继续向下进行之前，有必要了解一下msghdr 和 cmsghdr 结构体，先来看看 msghdr 。
+
+```cpp
+struct msghdr { 
+    void          *msg_name; 
+    socklen_t     msg_namelen; 
+    struct iovec  *msg_iov; 
+    size_t        msg_iovlen; 
+    void          *msg_control; 
+    size_t        msg_controllen; 
+    int           msg_flags; 
+};  
+```
+
+结构成员可以分为下面的四组，这样看起来就清晰多了：
+
+- 套接口地址成员 msg_name 与 msg_namelen ；
+
+  只有当通道是数据报套接口时才需要； msg_name 指向要发送或是接收信息的套接口地址。 
+
+  msg_namelen 指明了这个套接口地址的长度。msg_name 在调用 recvmsg 时指向接收地址，在调用 sendmsg 时指向目的地址。注意， msg_name 定义为一个(void *) 数据类型，因此并不需要将套接口地址显示转换为 (struct sockaddr *) 。
+
+- I/O 向量引用 msg_iov 与 msg_iovlen
+
+  它是实际的数据缓冲区，从下面的代码能看到，我们的 1 个字节就交给了它；这个 msg_iovlen 是 msg_iov 的个数，不是什么长度。msg_iov 成员指向一个 struct iovec 数组， iovc 结构体在 sys/uio.h 头文件定义，它没有什么特别的。
+
+  ```cpp
+  struct iovec { 
+     ptr_t iov_base; /* Starting address */ 
+     size_t iov_len; /* Length in bytes */ 
+  }; 
+  ```
+
+  有了 iovec ，就可以使用 readv 和 writev 函数在一次函数调用中读取或是写入多个缓冲区，显然比多次 read ，write 更有效率。 readv 和 writev 的函数原型如下：
+
+  ```cpp
+  #include <sys/uio.h> 
+  int readv(int fd, const struct iovec *vector, int count); 
+  int writev(int fd, const struct iovec *vector, int count); 
+  ```
+
+- 附属数据缓冲区成员 msg_control 与 msg_controllen ，描述符就是通过它发送的，后面将会看到， msg_control指向附属数据缓冲区，而 msg_controllen 指明了缓冲区大小。
+
+- 接收信息标记位 msg_flags ；忽略
+
+轮到 cmsghdr 结构了，附属信息可以包括若干个单独的附属数据对象。在每一个对象之前都有一个 struct cmsghdr 结构。头部之后是填充字节，然后是对象本身。最后，附属数据对象之后，下一个 cmsghdr 之前也许要有更多的填充字节。
+
+```cpp
+struct cmsghdr { 
+  socklen_t cmsg_len; 
+  int    cmsg_level; 
+  int    cmsg_type; 
+  /* u_char   cmsg_data[]; */ 
+}; 
+```
+
+cmsg_len  附属数据的字节数，这包含结构头的尺寸，这个值是由 CMSG_LEN() 宏计算的；
+
+cmsg_level 表明了原始的协议级别 ( 例如， SOL_SOCKET) ；
+
+cmsg_type 表明了控制信息类型 ( 例如， SCM_RIGHTS ，附属数据对象是文件描述符； SCM_CREDENTIALS，附属数据对象是一个包含证书信息的结构 ) ；
+
+被注释的 cmsg_data 用来指明实际的附属数据的位置，帮助理解。
+
+对于 cmsg_level 和 cmsg_type ，当下我们只关心 SOL_SOCKET 和 SCM_RIGHTS 。
