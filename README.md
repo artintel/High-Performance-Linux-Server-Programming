@@ -1704,3 +1704,288 @@ cmsg_type 表明了控制信息类型 ( 例如， SCM_RIGHTS ，附属数据对�
 被注释的 cmsg_data 用来指明实际的附属数据的位置，帮助理解。
 
 对于 cmsg_level 和 cmsg_type ，当下我们只关心 SOL_SOCKET 和 SCM_RIGHTS 。
+
+# 第14章 多线程编程
+
+本章讨论的线程相关的内容都属于 `POSIX` 线程(pthread)标准，不局限于  `NPTL` 实现，具体包括：
+
+- 创建线程和结束线程
+- 读取和设置线程属性
+- `POSIX` 线程同步方式：`POSIX` 信号量、互斥锁和条件变量
+
+## 14.1 Linux 线程概述
+
+线程是程序中完成一个独立任务的完整执行序列，即一个可调度的实体。
+
+线程可分为内核线程和用户线程。
+
+- 内核线程 运行在内核空间，由内核来调度
+- 用户线程 运行在用户空间，由线程库来调度。
+
+当进程的一个内核线程获得 CPU 的使用权时，它就加载并运行一个用户线程。由此，内核线程相当于用户线程运行的“容器”。一个进程可以用由 M 个内核线程和 N 个用户线程，其中 M <= N。并且在一个系统的所有进程中， M 和 N 的比值都是固定的。按照 M : N 的取值，线程的实现可以分为三种模式：完全在用户空间实现、完全由内核调度和双层调度
+
+完全在用户空间实现的线程无须内核的支持，内核甚至根本不知道这些线程的存在。线程库负责管理所有执行线程，比如线程的优先级、时间片等。线程库利用 `longjmp` 来切换线程的执行，使它们看起来像是 “并发” 执行的。但实际上内核仍然是把整个进程作为最小单位来调度的。换句话说。一个进程的所有执行线程共享该进程的时间片，它们对外表现出相同的优先级。因此，对于这种实现方式而言， N = 1，即 M 个用户空间线程对应 1 个内核线程，而该内核线程实际上就是进程本身。完全在用户空间实现的线程的优点是：创建和调度线程都无须内核的干预，因此速度相当快。并且由于它不占用额外的内核资源，所以即使一个进程创建了很多线程，也不会对系统性能造成明显的影响。其缺点是：对于多处理器系统，一个进程的多个线程无法运行在不同的 CPU 上，因为内核是按照最小调度单位类分配 CPU 的。此外，线程的优先级只对同一个进程中的线程有效，比较不同进程中的线程的优先级没有意义。
+
+完全由内核调度的模式将创建、调度线程的任务都交给了内核，运行在用户空间的线程库无须执行管理任务，这与完全在用户空间实现的线程恰恰相反。二者的优缺点也正好呼唤。
+
+双层调度模式是前两种实现模式的混合体：内核调度 M 个内核线程，线程库调度 N 个用户线程。这种线程实现方式结合了前两种方式的优点：不但不会消耗过多的内核资源，而且线程切换速度也比较快，同时也可以充分利用多处理器的优势。
+
+### 14.1.2 Linux 线程库
+
+LinuxThreads 线程库的内核线程使用 `clone` 系统调用创建的进程模拟的。`clone` 系统调用和 `fokr` 系统调用的作用类似：创建调用进程的子进程。不过我们可以为 `clone` 系统调用指定 `CLONE_THREAD` 标志，这种情况下它创建的子进程与调用进程共享相同的虚拟地址空间、文件描述符和信号处理函数，这些都是线程的特点。不过，用进程来模拟内核线程会导致很多语义问题：
+
+- 每个线程拥有不同的 PID 不符合 `POSIX` 规范
+- Linux 信号处理本来是基于进程的，但现在一个进程内部的所有线程都能而且必须处理信号
+- 用户 ID、组 ID 对一个进程中的不同线程来说可能是不一样的
+- 程序产生的核心转储文件不会包含所有线程信息，而只包含产生该核心转储文件的线程的信息
+- 由于每个线程都是一个进程，因此系统允许的最大进程数也就是最大线程数
+
+`LinuxThreads` 线程库的一个有名特性便是管理线程。它是进程中专门用于管理其他工作线程的线程。其作用包括：
+
+- 系统发送给进程的终止信号先由管理线程接收，管理线程再给其他工作线程发送同样的信号以终止它们
+
+- 当终止工作线程或工作线程主动退出时，管理线程必须等待它们技术，以避免僵尸进程
+
+  > 僵尸进程是指一个已经终止、但是其父进程尚未对其进行善后处理获取终止进程的有关信息的进程，这个进程被称为“僵尸进程”(zombie)。
+  >
+  > **怎样产生僵尸进程**
+  >
+  > 一个进程在调用exit命令结束自己的生命的时候，其实它并没有真正的被销毁，而是留下一个称为 僵尸进程（Zombie）的数据结构（系统调用exit， 它的作用是使进程退出，但也仅仅限于将一个正常的进程变成一个僵尸进程，并不能将其完全销毁）。
+  >
+  > 在Linux进程的状态中，僵尸进程是非常特殊的一种，它已经放弃了几乎所有内存空间，没有任何可执行代码，也不能被调度，仅仅在进程列表中保留一个位 置，记载该进程的退出状态等信息供其他进程收集。除此之外，僵尸进程不再占有任何内存空间。它需要它的父进程来为它收尸，如果他的父进程没安装 SIGCHLD 信号处理函数调用wait或waitpid()等待子进程结束，又没有显式忽略该信号，那么它就一直保持僵尸状态，如果这时父进程结束了， 那么init进程自动会接手这个子进程，为它收尸，它还是能被清除的。但是如果如果父进程是一个循环，不会结束，那么子进程就会一直保持僵尸状态，这就是 为什么系统中有时会有很多的僵尸进程。
+
+- 如果主线程先于其他工作线程退出，则管理线程将阻塞它，知道所有其他工作线程都结束后才唤醒它
+
+- 回收每个线程堆栈使用的内存
+
+管理线程的引入，增减了额外的系统开销。并由于只能运行在一个 CPU 上，所以 `LinuxThreads` 线程也不能充分利用多出力系统的优势。后来 `NPTL` 线程库产生，其主要优势在于：
+
+- 内核线程不再是一个进程，因此避免了很多用进程模拟内核线程导致的语义问题
+- 摈弃了管理线程，终止线程、回收线程堆栈等工作都可以由内核来完成
+- 由于不存在管理线程，所以一个进程的线程可以运行在不同的 CPU 上，从而充分利用了多处理器系统的优势
+- 线程的同步由内核来完成。隶属于不同进程的线程之间也能共享互斥锁，因此可以实现跨进程的线程同步
+
+## 14.2 创建线程和结束线程
+
+`Linux` 系统上，它们都定义在 `pthread.h` 头文件中
+
+1. pthread_create
+
+   创建一个线程的函数时 `pthread_create` 定义如下：
+
+   ```cpp
+   #include <pthread.h>
+   int pthread_create( pthread_t* thread, const pthread_attr_t* attr, void* ( *start_routine )( void* ), void* arg );
+   ```
+
+   - thread 新线程的标识符，后续 `phtread_*` 函数通过它来引用新线程。其类型 `pthread_t` 的定义如下
+
+     ```cpp
+     #include <bits/pthreadtypes.h>
+     typedef unsigned long int pthread_t
+     ```
+
+     可见，`pthread_t`是一个整型类型。实际上，`Linux` 上几乎所有的资源标识符都是一个整形数，比如 `socket、`各种 `System V IPC` 标识符等
+
+   - attr 用于设置新线程的属性。给它传递 NULL 表示使用默认线程属性。线程拥有众多属性。
+
+   - start_routine / arg 分别指定新线程将运行的函数及其参数
+
+   该函数成功返回 0 。
+
+2. pthread_exit
+
+   线程一旦被创建好，内核就可以调度内核线程来执行 `start_routine` 函数指针所指向的函数了。线程函数在结束时最好调用如下函数，以确保安全、干净地退出
+
+   ```cpp
+   #include <pthread.h>
+   void pthread_exit( void* retval );
+   ```
+
+   `pthread_exit` 通过 `retval` 参数向线程地回收者传递其退出信息。它执行完之后不会返回到调用者，而且永远不会失败
+
+3. pthread_join
+
+   一个进程中的所有线程都可以通过 `pthread_join` 函数来回收其他线程（前提是目标线程是可回收的），即等待其他线程结束，这类似于回收进程的 `wait` 和 `waitpid` 系统调用。定义如下:
+
+   ```cpp
+   #include <pthread.h>
+   int pthread_join( pthread_t thread, void** retval );
+   ```
+
+   - thread 目标线程的标识符
+   - retval 目标线程返回的退出信息。该函数会一直阻塞，直到被回收的线程结束为止。
+
+   该函数可能引发的错误码
+
+   | 错误码  | 描述                                                         |
+   | ------- | ------------------------------------------------------------ |
+   | EDEADLK | 可能引起死锁。比如两个线程互相针对对方调用 `pthread_join`，或者线程对自身调用 |
+   | EINVAL  | 目标线程是不可回收的，或者已经有其他线程在回收该目标线程     |
+   | ESRCH   | 目标线程不存在                                               |
+
+4. pthread_cancel
+
+   异常终止一个线程，即取消线程，可通过如下函数实现：
+
+   ```cpp
+   #include <pthread.h>
+   int pthread_cancel( phtread_t thread );
+   ```
+
+   - thread 目标线程的标识符。该函数成功返回 0，失败则返回错误码。不过接收到取消请求的目标线程可以决定是否允许被取消以及如何取消，这分别由如下两个函数完成：
+
+     ```cpp
+     #include <pthread.h>
+     int pthread_setcancelstate( int state, int* oldstate );
+     int pthread_setcanceltype( int type, int* oldtype );
+     ```
+
+     这两个函数的第一个参数分别用于设置线程的取消状态 ( 是否允许取消 ) 和取消类型 ( 如何取消 )，第二个参数分别记录线程原来的取消状态和取消类型。
+
+   - state 参数有两个可选值
+
+     - `PTHREAD_CANCEL_ENABLE` 允许线程被取消。默认取消
+     - `PTHREAD_CANCEL_DISABLE` 禁止线程被取消。这种情况，如果一个线程收到取消请求，则它会将请求挂起，知道该线程允许被取消
+
+   - type 参数也有两个可选值
+
+     - `PTHREAD_CANCEL_ASYNCHRONOUS` 线程随时都可以被取消。他将使得接收到取消请求的目标线程立即采取行动
+     - `PTHREAD_CANCEL_DEFERRED` 允许目标线程推迟行动，直到它调用了下面几个所谓取消点函数中的一个：`pthread_join、pthread_testcancel、pthread_cond_wait、pthread_cond_timedwait、sem_wait` 和 `sigwait`。根据 `POSIX` 标准，其他可能阻塞的系统调用，比如 `read、wait`，也可以称为取消点。
+
+## 14.3 线程属性
+
+`pthread_attr_t` 结构体定义了一套完整的线程属性：
+
+```cpp
+#include <bits/pthreadtypes.h>
+#define __SIZEOF_PTHREAD_ATTR_T 36
+typedef union{
+	char __size[ __SIZEOF_PTHREAD_ATTR_T ];
+    long int __align;
+} pthread_attr_t;
+```
+
+可见，各种线程属性全部包含在一个字符数组中。线程库定义了一些列函数来操作 `pthread_attr_t` 类型的变量，以方便我们获取和设置线程属性，这些函数包括:
+
+```cpp
+#include <pthread.h>
+/* 初始化线程属性对象 */
+int pthtread_attr_init ( pthread_attr* attr );
+/* 销毁线程属性对象。被销毁的线程属性对象只有再次初始化之后才能继续使用 */
+int pthread_attr_destroy ( pthread_attr_t* attr );
+/* 下面这些函数用于获取和设置线程属性对象的某个属性 */
+int pthread_attr_getdetachstate( const pthread_attr_t* attr, int* detachstate );
+int pthread_attr_setdetachstate( pthread_attr_t* attr, int detachstate );
+int ptrhead_attr_getstackaddr( const pthread_attr_t* attr, int detachstate );
+int pthread_attr_setstackaddr( pthread_attr_t attr, void* stackaddr );
+int pthread_attr_getstacksize( const pthread_attr_t* attr, size_t* stacksize );
+int pthread_attr_setstacksize( pthread_attr_t* attr, size_t stacksize );
+int pthread_attr_getstack( const pthread_attr_t* attr, void** stackaddr, size_t* stacksize );
+...
+```
+
+- detachstate 线程的脱离状态。它有 `PTHREAD_CREATE_JOINABLE` 和 `PTHREAD_CREATE_DETACH` 两个可选值。前者指定线程是可以被回收的，后者使调用线程脱离与进程中其他线程的同步，脱离了与其他线程同步的线程称为“脱离线程”。脱离线程在退出时将自行释放其占用的系统资源。线程创建时该属性的默认值时 `PTHREAD_CREATE_JOINABLE`。此外，也可以使用 `pthread_detach` 函数直接将线程设置为脱离线程
+- `stackaddr` 和 `stacksize`, 线程堆栈的起始地址和大小。可以使用 `ulimt -s` 命令来查看或者修改这个默认值
+- `guardsize` 保护区域大小。如果大于 0，系统创建线程的时候会在其堆栈的尾部额外分配 `guardsize` 字节的空间，作为保护堆栈不被错误地覆盖的区域。如果等于 0，则不为新创建的线程设置对战保护区。使用者可以通过 `pthread_attr_setstackaddr` 或 `pthread_attr_setstack` 手动设置线程的堆栈，则 `guardsize` 属性被忽略
+- `schedparam` 线程调度参数。其类型是 `sched_param` 结构体
+- `schedpolicy` 线程调度策略。该属性有 `SCHED_FIFO、SCHED_RR` 和 `SCHED_OTHRE` 三个可选值，第三个是默认值。`SCHED_RR` 表示采用轮转算法( round-robin )调度，`SCHED_FIFO` 表示使用先进先出的方法调度，这两种调度方法都具备实时调度功能，但只能用于以超级用户身份运行的线程。
+- `inheritsched` 是否继承调用线程的调度属性。该属性有关 `PTHREAD_INHERIT_SCHED` 和 `PTHREAD_EXPLICIT_SCHED` 两个可选值。前者表示新县城沿用其创建者的线程调度参数，这种情况下再设置新线程的调度参数属性将没有任何效果。后者表示调用者要明确地指定新线程地调度参数
+- `scope` 线程间竞争 CPU 的范围，即线程优先级的有效范围。`POSIX` 标准定义了该属性的 `PTHREAD_SCOPE_SYSTEM` 和 `PTHREAD_SCOPE_PROCESS` 两个可选值，前者表示目标线程与系统中所有线程一起竞争 CPU 的使用，后者表示目标线程仅与其他隶属于统一进程的线程京城CPU 的使用，目前 `Linux` 只支持 `PTHREAD_SCOPE_SYSTEM` 一种取值
+
+## 14.4 POSIX 信号量
+
+和多进程程序一样，多线程程序也必须考虑同步问题。讨论 3 种专门用于线程同步的机制：POSIX 信号量、互斥量和条件变量。
+
+在  `Linux` 上，信号量 API 有两组。一组是 13 章讨论的 `System V IPC` 信号量，两一个组是 `POSIX` 信号量。两组接口很相似，但不保证能呼唤。
+
+`POSIX` 信号量函数的名字都以 `sem_` 开头。常用的 `POSIX` 信号量函数如下：
+
+```cpp
+#include <semaphore.h>
+int sem_init( sem_t* sem, int pshared, unsigned int value );
+int sem_destroy( sem_t* sem );
+int sem_wait( sem_t* sem );
+int sem_trywait( sem_t* sem );
+int sem_post( sem_t* sem );
+```
+
+这些函数的第一个参数 `sem` 执行被操作的信号量
+
+- sem_init 用于初始化一个未命名的信号量。
+  - pshared 指定信号量的类型。如果其值为 0，就表示这个信号量是当前进程的局部信号量，否则该信号量就可以在多个进程之间共享。
+  - value 指定信号量的初始值。此外，初始化一个已经被初始化的信号量将导致不可预期的结果
+- sem_destroy 用于销毁信号量，以释放其占用的内核资源。如果销毁一个整备其他线程等待的信号量，则将导致不可预期的结果
+- sem_wait 以原子操作的方式将信号量的值减 1。如果信号量的值为 0，则 `sem_wait` 将被阻塞，直到这个信号量具有非 0 值
+- `sem_trywait` 与 `sem_wait` 相似，不过它始终立即返回，而不论被操作的信号量是否具有非 0 值，相当于 `sem_wait` 的非阻塞版本。当信号量的值为非 0 时，`sem_trywait` 对信号量执行减 1 操作。当信号量的值为 0 时，将返回  -1 并设置 errno 为 EAGAIN
+- `sem_post` 以原子操作的方式将信号量的值加 1。当信号量值大于 0 时，其他正在调用 `sem_wait` 等待信号量的线程将被唤醒
+
+## 14.5 互斥锁
+
+互斥锁( 也称互斥量 ) 可以用于保护关键代码段，以确保其独占式的访问，这有点像一个二进制信号量。。当进入关键代码段时，我们需要获得互斥锁来将其加锁，这等价于二进制信号量的 P 操作；当离开关键代码段时，需要对互斥锁解锁，以唤醒其他等待该互斥锁的线程，这等价于二进制信号量的 V 操作
+
+### 14.5.1 互斥锁基础 API
+
+`POSIX` 互斥锁的相关函数主要有如下 5 个：
+
+```cpp
+#include <pthread.h>
+int pthread_mutex_init( pthread_mutex_t* mutex, const pthread_mutexattr_t* mutexattr );
+int pthread_mutex_destroy( pthread_mutex_t* mutex );
+int ptrhead_mutex_lock( pthread_mutex_t* mutex );
+int pthread_mutex_trylock( phtread_mutex_t* mutex );
+int pthread_mutex_unlock( phtread_mutex_t* mutex );
+```
+
+这些函数的第一个参数 `mutex` 指向要操作的目标互斥锁，互斥锁的类型时 `pthread_mutex_t` 结构体。
+
+- pthread_mutex_init 初始化互斥锁。
+
+  - mutexattr 指定互斥锁属性。如果设置为 `NULL`, 则表示使用more属性。除了这个而函数，还可以使用如下方式来初始化一个互斥锁
+
+    ```cpp
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    ```
+
+    宏 `PTHREAD_MUTEX_INITIALIZER` 实际上只是把互斥锁的各个字段都初始化为 0.
+
+- pthread_mutex_destroy 用于销毁互斥锁，以释放器占用的内核资源。销毁一个已经加锁的互斥锁将导致不可预期的候过
+
+- pthread_mutex_lock 以原子操作的方式给一个互斥锁加锁。如果目标互斥锁已经被锁上，则 `pthread_mutex_lock` 调用将阻塞，直到该互斥锁的占有者将其解锁
+
+- pthread_mutex_trylock 与 pthread_mutex_lock 类似，不过始终立即返回，相当于非阻塞版本。当互斥锁已经被加锁时，`pthread_mutex_trylock` 将返回错误码 `EBUSY`。需要注意的是，这里讨论的 `pthread_mutex_lock` 和 `pthread_mutex_trylock` 的行为是针对普通锁而言的。
+
+- pthread_mutex_unlock 以原子操作的方式给一个互斥锁解锁。如果此时有其他线程正在等待这个互斥锁，则这些线程种的某一个将获得它
+
+### 14.5.2 互斥锁属性
+
+pthread_mutexattr_t 结构体定义了一套完整的互斥锁属性。线程库提供了一系列函数来操作 `pthread_mutexattr_t` 类型的变量，以方便哦我们获取和设置互斥锁属性。
+
+```cpp
+#include <pthread.h>
+/* 初始化互斥锁属性对象 */
+int ptrhead_mutexattr_init( phtread_mutexattr_t* attr );
+/* 销毁互斥锁属性对象 */
+int pthread_mutexattr_destroy( pthread_mutexattr_t* attr );
+/* 获取和设置互斥锁的 pshared 属性 */
+int pthread_mutexattr_getpshared( const pthread_mutexattr_t* attr, int* pshared );
+int pthread_mutexattr_setpshared( pthread_mutexattr_t* attr, int* pshared );
+/* 获取和设置互斥锁的 type 属性 */
+int pthread_mutexattr_gettype( const pthread_mutexattr_t* attr, int type );
+int pthread_mutexattr_settype( pthread_mutexattr_t* attr, int type );
+```
+
+互斥锁属性 `pshared` 执行随否允许跨进程共享互斥锁，可选值有两个：
+
+- PTHREAD_PROCESS_SHARED 互斥锁可以被进程共享
+- PTHREAD_PROCESS_PRIVATE 互斥锁只能被和锁的初始化线程隶属于同一个进程的线程共享
+
+互斥锁属性 `type` 指定互斥锁的类型。`Linux` 支持如下 4 种类型的互斥锁：
+
+- PTHREAD_MUTEX_NORMAL 普通锁。这是互斥锁默认的类型。当一个线程与一个普通锁加锁之后，其余请求该所的线程将形成一个等待队列，并在该锁解锁后按优先级获得。这种所保证了资源分配的公平性，但这种锁也容易引发问题：一个线程如果对一个已经加锁的普通锁再次加锁，将引发死锁：对一个已经被其他线程加锁的普通所解锁，或者对一个已经解锁的普通锁再次解锁，将导致不可语气的候过
+- PTHREAD_MUTEX_ERRORCHECK 检错锁。一个线程如果对一个已经加锁的检错锁再次加锁，则加锁操作返回 EREADLK。对一个已经被其他线程加锁的检错锁解锁，或者对一个已经解锁的检错锁再次解锁，则解锁操作返回EPERM
+- PTHREAD_MUTEX_RECURSIVE 嵌套锁。这种锁允许一个线程在释放锁之前多次对它加锁而不发生死锁。不过其他线程如果要获得这个锁，则当前所的拥有者不许执行相应次数的解锁操作。对一个已经被其他线程加锁的嵌套所解锁，或者对一个已经解锁的嵌套所再次解锁，则解锁操作返回 `EPERM`
+- PTHREAD_MUTEX_DEFAULT 默认锁。一个线程如果对一个已经加锁的默认锁再次加锁，或者对一个已经被其他线程加锁的默认锁解锁，或者对一个已经解锁的默认锁再次解锁，将导致不可预期的候过。这种锁在实现的时候可能被映射为上面三种锁之一。
+
+### 14.5.3 死锁举例
+
