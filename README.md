@@ -1989,3 +1989,384 @@ int pthread_mutexattr_settype( pthread_mutexattr_t* attr, int type );
 
 ### 14.5.3 死锁举例
 
+互斥锁的一个很严重的问题就是死锁。死锁使得一个或多个线程被挂起而无法继续执行，而且这种情况还不容易被发现。前文，在一个线程中对一个已经加锁的普通锁再次加锁，将导致死锁。这种情况可能出现在设计得不够仔细地递归函数中。另外，如果两个线程按照不同地顺序来申请两个互斥锁，也容易产生死锁
+
+**lock.cpp**
+
+![image-20210302161312740](image/image-20210302161312740.png)
+
+在该代码种，主线程试图先占有互斥锁 `mutex_a`，然后操作被该所保护地变量 a，但操作完毕后，主线程没有立即释放互斥锁 `mutex_a`，而是又申请互斥锁 `mutex_b`，并在两个互斥锁地保护下，操作变量 a 和 b，最后才一起释放这两个互斥锁；于此同时，子线程则按照相反地顺序来申请互斥锁 `mutex_a` 和 `mutex_b`，并在两个锁的保护下操作变量 a 和 变量 b。用 `sleep` 函数来模拟连续两次调用 `phtread_mutex_lock` 之间的时间差，以确保代码中的两个线程各自先占有一个互斥锁（ 主线程占有 `mutex_a`，子线程占有 `mutex_b` ），然后各自等待另一个互斥锁。这样，两个线程就僵持住了，谁都不能继续往下执行，从而形成死锁。
+
+## 14.6 条件变量
+
+如果互斥锁是用于同步线程对共享数据的访问的话，那么条件变量则是用于在线程之间同步共享数据的值。条件变量提供了一种线程间的通知机制：当某个共享数据达到某个值的时候，唤醒等待这个共享数据的线程。
+
+条件变量相关的函数主要有如下 5 个：
+
+```cpp
+#include <pthread.h>
+int pthread_cond_init( pthread_cond_t* cond, const pthread_condattr_t* cond_attr );
+int pthread_cond_destroy( pthread_cond_t* cond );
+int pthread_cond_broadcast( pthread_cond_t* cond );
+int pthread_cond_signal( pthread_cond_t* cond );
+int pthread_cond_wait( pthread_cond_t* cond, pthread_mutex_t* mutex );
+```
+
+这些函数的第一个参数 cond 指向要操作的目标条件变量，条件变量的类型是 `pthread_cond_t` 结构体。
+
+- pthread_cond_init 用于初始化条件变量。
+
+  - cond_attr 执行条件变量的属性。如果设置为 NULL，则表示使用默认属性。条件变量的属性不多，而且和互斥锁的属性类型相似。除了 `pthread_cond_init` 函数外，还可以使用如下方式来初始化一个条件变量
+
+    `pthread_cond_t cond = PTHREAD_COND_INITIALIZER;`
+
+    宏 `PTHREAD_COND_INITIALIZER` 实际上只是把条件变量的各个字段都初始化为 0
+
+- pthread_cond_destroy 用于销毁条件变量，以释放其占用的内核资源。销毁一个正在被等待的条件变量将失败并返回 EBUSY
+
+- pthread_cond_broadcast 以广播的方式唤醒所有等待目标条件变量的线程
+
+- pthread_cond_signal 用于唤醒一个等待目标条件变量的线程。只与哪个线程将被唤醒，则取决于线程的优先级和调度测录。有时候我们可能像唤醒一个指定的线程，但 pthread 没有对该需求提供解决办法。不过可以间接地实现该需求：定义一个能够唯一标识目标线程的全局变量，在唤醒等待条件变量的线程前先设置该变量为目标线程，然后采用广播方式唤醒所有等待条件变量的线程，这些线程被唤醒后都检查该变量以判断被唤醒的是否是自己，如果是，就开始执行后续代码，如果不是继续等待。
+
+- pthread_cond_wait 用于等待目标条件变量。
+
+  - mutex 用于保护条件变量的互斥锁，以确保 `pthread_cond_wait` 操作的原子性。在调用 `phtread_cond_wait` 前，必须确保互斥锁 `mutex` 已经加锁。
+
+  - pthread_cond_wait 函数执行时，首先把调用线程放入条件变量的等待队列中，然后将互斥锁 `mutex` 解锁。可见，从 `pthread_cond_wait` 开始执行到其调用线程被放入条件变量的等待队列之间的这段时间内，`pthread_cond_signal` 和 `pthread_cond_broadcast` 等函数不会修改条件变量。即：`pthread_cond_wait` 函数不会错过目标条件变量的任何变化。当 `pthread_cond_wait` 函数成功返回时，互斥锁 `mutex` 将再次被锁上
+
+    ```cpp
+    #include <pthread.h>
+    #include <unistd.h>
+     
+    static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+    static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+     
+    struct node {
+    int n_number;
+    struct node *n_next;
+    } *head = NULL;
+     
+    /*[thread_func]*/
+    static void cleanup_handler(void *arg)
+    {
+        printf("Cleanup handler of second thread./n");
+        free(arg);
+        (void)pthread_mutex_unlock(&mtx);
+    }
+    static void *thread_func(void *arg)
+    {
+        struct node *p = NULL;
+     
+        pthread_cleanup_push(cleanup_handler, p);    // 拓展https://blog.csdn.net/longbei9029/article/details/72871714
+        while (1) 
+    	{
+    		pthread_mutex_lock(&mtx);  //这个mutex主要是用来保证pthread_cond_wait的并发性
+    		while (head == NULL)   
+    		{ //这个while要特别说明一下，单个pthread_cond_wait功能很完善，为何这里要有一个while (head == NULL)呢？因为pthread_cond_wait里的线程可能会被意外唤醒，如果这个时候head != NULL，则不是我们想要的情况。这个时候，应该让线程继续进入pthread_cond_wait
+    			pthread_cond_wait(&cond, &mtx); // pthread_cond_wait会先解除之前的pthread_mutex_lock锁定的mtx，然后阻塞在等待对列里休眠，直到再次被唤醒（大多数情况下是等待的条件成立而被唤醒，唤醒后，该进程会先锁定先pthread_mutex_lock(&mtx);，再读取资源
+    			//用这个流程是比较清楚的/*lock-->unlock-->wait() return-->lock*/
+    		}
+            p = head;
+            head = head->n_next;
+            printf("Got %d from front of queue/n", p->n_number);
+            free(p);
+            pthread_mutex_unlock(&mtx); //临界区数据操作完毕，释放互斥锁
+        }
+        pthread_cleanup_pop(0);
+        return 0;
+    }
+     
+    int main(void)
+    {
+        pthread_t tid;
+        int i;
+        struct node *p;
+        pthread_create(&tid, NULL, thread_func, NULL);   //子线程会一直等待资源，类似生产者和消费者，但是这里的消费者可以是多个消费者，而不仅仅支持普通的单个消费者，这个模型虽然简单，但是很强大
+        /*[tx6-main]*/
+        for (i = 0; i < 10; i++) 
+    	{
+            p = malloc(sizeof(struct node));
+            p->n_number = i;
+            pthread_mutex_lock(&mtx);             //需要操作head这个临界资源，先加锁，
+            p->n_next = head;
+            head = p;
+            pthread_cond_signal(&cond);
+            pthread_mutex_unlock(&mtx);           //解锁
+            sleep(1);
+        }
+        printf("thread 1 wanna end the line.So cancel thread 2./n");
+        pthread_cancel(tid);             //关于pthread_cancel，有一点额外的说明，它是从外部终止子线程，子线程会在最近的取消点，退出线程，而在我们的代码里，最近的取消点肯定就是pthread_cond_wait()了。关于取消点的信息，有兴趣可以google,这里不多说了
+        pthread_join(tid, NULL);
+        printf("All done -- exiting/n");
+        return 0;
+    }
+    ```
+
+## 14.7 线程同步机制包装类
+
+分了充分复用代码，将前面讨论的 3 种线程同步机制分别封装成 3 个类，是现在 `locker.h` 中
+
+**locker.h**
+
+```cpp
+#ifndef LOCKER_H
+#define LOCKER_H
+
+#include <exception>
+#include <pthread.h>
+#include <semaphore.h>
+
+/* 封装信号量的类 */
+class sem{
+public:
+    /* 创建并初始化信号量 */
+    sem(){
+        if( sem_init( &m_sem, 0, 0) != 0 ){
+            /* 构造函数没有返回值，可以通过抛出异常来报告错误 */
+            throw std::exception();
+        }
+    }
+    /* 销毁信号量 */
+    ~sem(){
+        sem_destroy( &m_sem );
+    }
+    /* 等待信号量 */
+    bool wait(){
+        return sem_wait( &m_sem ) == 0;
+    }
+    /* 增加信号量 */
+    bool post(){
+        return sem_post( &m_sem ) == 0;
+    }
+private:
+    sem_t m_sem;
+};
+/* 封装互斥锁的类 */
+class locker{
+public:
+    /* 创建并初始化锁 */
+    locker(){
+        if( pthread_mutex_init( &m_mutex, NULL ) != 0 ){
+            throw std::exception();
+        }
+    }
+    /* 销毁互斥锁 */
+    ~locker(){
+        pthread_mutex_destroy( &m_mutex );
+    }
+    /* 获取互斥锁 */
+    bool lock(){
+        return pthread_mutex_lock( &m_mutex ) == 0;
+    }
+    /* 释放互斥锁 */
+    bool unlock(){
+        return pthread_mutex_unlock( &m_mutex ) == 0;
+    }
+private:
+    pthread_mutex_t m_mutex;
+};
+/* 封装条件变量的类 */
+class cond{
+public:
+    /* 创建并初始化条件变量 */
+    cond(){
+        if( pthread_mutex_init( &m_mutex, NULL ) != 0 ){
+            throw std::exception();
+        }
+        if( pthread_cond_init( &m_cond, NULL ) != 0 ){
+            /* 构造函数中一旦初夏难问题，就应该立即释放已经成功分配了的资源 */
+            pthread_mutex_destroy( &m_mutex );
+            throw std::exception();
+        }
+    }
+    /* 销毁条件变量 */
+    ~cond(){
+        pthread_mutex_destroy( &m_mutex );
+        pthread_cond_destroy( &m_cond );
+    }
+    /* 等待条件变量 */
+    bool wait(){
+        int ret = 0;
+        pthread_mutex_lock( &m_mutex );
+        ret = pthread_cond_wait( &m_cond, &m_mutex );
+        pthread_mutex_unlock( &m_mutex );
+        return ret == 0;
+    }
+    /* 唤醒等待条件变量的线程 */
+    bool signal(){
+        return pthread_cond_signal( &m_cond ) == 0;
+    }
+private:
+    pthread_mutex_t m_mutex;
+    pthread_cond_t m_cond;
+};
+
+#endif
+```
+
+## 14.8 多线程环境
+
+### 14.8.1 可重入函数
+
+如果一个函数能被多个线程同时调用且不用发生竞态条件，则我们称它是线程安全的 ( thread safe )，或者说它是可重入函数。`Linux`库函数只有一小部分是不可重入的，比如 `inet_ntoa`函数，以及 `getservbyname` 和 `getservbyport`函数。这些库函数之所以不可重入的主要原因是其内部使用了静态变量。但这这都有对应的可重入版本，这些可重入版本的函数名是在原函数名尾部加上 `_r`。
+
+### 14.8.2 线程和进程
+
+如果一个多线程程序的某个线程调用了 `fork` 函数，那么新创建的子进程是否将自动创建和父进程相同数量的线程呢？答案是 "否"。子进程只拥有一个执行线程，它是调用 `fork` 的那个线程的完整复制。并且子进程将自动继承父进程中互斥锁（条件变量与之类似）的状态。也就是说，父进程中已经被加锁的互斥锁在子进程中也是被锁住的。这就引起了一个问题：子进程可能不清楚从父进程继承而来的互斥锁的具体状态（是加锁还是解锁状态）。这个互斥锁可能被加锁了，但并不是由调用 `fork` 函数的那个线程锁住的，而是由其他线程锁住的。如果是这种情况，则子进程若再次对该互斥锁执行加锁操作就会导致死锁
+
+**fork_lock.cpp**
+
+```cpp
+#include <pthread.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <wait.h>
+#include <stdio.h>
+
+pthread_mutex_t mutex;
+/* 子线程运行的函数。它首先获得互斥锁 mutex，然后暂停 5 s，再次释放该互斥锁 */
+void* another( void* arg ){
+    printf( "in child thread, lock the mutex\n" );
+    pthread_mutex_lock( &mutex );
+    sleep(5);
+    pthread_mutex_unlock( &mutex );
+}
+int main(){
+    pthread_mutex_init( &mutex, NULL );
+    pthread_t id;
+    pthread_create( &id, NULL, another, NULL );
+    /* 父进程中的主线程暂停 1s，以确保在执行 fork 操作之前，子线程已经开始运行并获得了互斥变量 mutex */
+    sleep(1);
+    int pid = fork();
+    if( pid < 0 ){
+        pthread_join( id, NULL );
+        pthread_mutex_destroy( &mutex );
+        return 1;
+    }
+    else if ( pid == 0 ){ //子进程
+        printf( "I am in the child, want to get the lock\n" );
+        /* 子进程从父进程继承了互斥锁 mutex 状态，该互斥锁处于锁住的状态，这是父进程中的子线程执行 pthread_mutex_lock
+        引起的，因此，下面这句加锁操作会一直阻塞，尽管从逻辑上来说它是不应该阻塞的 */
+        pthread_mutex_lock( &mutex );
+        printf( "I can not run to here, ...\n" );
+        pthread_mutex_unlock( &mutex );
+        exit( 0 );
+    }
+    else{
+        wait( NULL );
+    }
+    pthread_join( id, NULL );
+    pthread_mutex_destroy( &mutex );
+    return 0;
+}
+```
+
+不过，`pthread`提供了一个专门的函数 `pthread_atfork`，以确保 `fork` 调用后父进程和子进程都拥有一个清楚的锁状态，定义如下：
+
+```cpp
+#include <pthread.h>
+int pthread_atfork( void (*prepare)(void), void (*parent)(void), void (*child)(void) );
+```
+
+该函数将建立 3 个 `fork` 句柄来帮助我们清理互斥锁的状态。
+
+- `prepare`句柄将在 `fork` 调用创建出子进程之前被执行。它可以用来锁住所有父进程中的互斥锁。
+- `parent`句柄则是在 `fork` 调用创建出子进程之后，而 `fork` 返回之前，在父进程中被执行。他的作用是释放所有在 `prepare` 句柄中被锁住的互斥锁
+- `child` 句柄是 `fork` 返回之前，在子进程中被执行。和 `parent`句柄一样，`child`句柄也是用于释放所有在 `parent` 句柄中被锁住的互斥锁。
+
+因此要让上面的`fork_lock.cpp`代码正常工作，就应该在其中的 `fork` 调用前加入如下代码
+
+```cpp
+void prepare(){
+    pthread_mutex_lock( &mutex );
+}
+void infork(){
+    pthread_mutex_unlock( &mutex );
+}
+pthread_atfork( prepare, infork, infork );
+```
+
+![image-20210302194428495](image/image-20210302194428495.png)
+
+### 14.8.3 线程和信号
+
+每个线程都可以独立地设置信号掩码。在 10.3.2 小节，设置进程信号掩码和函数 `sigprocmask`，但在多线程环境下，应使用如下所示地 `pthread` 版本的 `sigprocmask` 函数来设置线程信号掩码
+
+```cpp
+#include <pthread.h>
+#include <signal.h>
+int pthread_sigmask( int how, const sigset_t* newmask, sigset_t* oldmask );
+```
+
+该函数的参数的含义与 `sigprocmask` 参数完全相同。
+
+由于进程中的所有线程共享该进程的信号，所以线程库将根据线程掩码决定把信号发送给哪个具体的线程。因此，如果我们在每个子线程中都单独设置信号掩码，就很容易导致逻辑错误。此外，所有线程共享信号处理函数。也就是说，当一个线程中设置了某个信号的信号处理函数后，它将覆盖其他线程为同一个信号设置的信号处理函数。这两点都说明，我们应该定义一个专门的线程来处理所有的信号。这可以通过如下两个步骤实现：
+
+1. 在主线程创建出其他子线程之前就调用 `pthread_sigmask`来设置好信号掩码，所有先创建的子线程都将自动继承这个信号掩码。这样做之后，实际上所有线程都不会响应被屏蔽的信号了。
+
+2. 在某个线程中调用如下函数来等待信号并处理：
+
+   ```cpp
+   #include <signal.h>
+   in sigwait( const sigset_t* set, int* sig );
+   ```
+
+   - set 指定需要等待的信号的集合。可以简单地将其指定为在第 1 补种创建的信号掩码，标识在该线程中等待所有被屏蔽的信号。
+   - sig 指向的整数用于存储该函数返回的信号值。
+
+   一旦 `sigwait` 正确返回，就可以对接收到的信号做处理了。如果使用了 `sigwait` ，就不应该再为信号设置信号处理函数了。
+
+如下代码展示了如何通过上述两个步骤实现在一个线程中处理所有信号
+
+**pthread_sig.cpp**
+
+```cpp
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+
+#define handle_error_en( en, msg )\
+do { errno = en; perror(msg); exit( EXIT_FAILURE ); } while( 0 )
+
+static void* sig_thread( void* arg ){
+    sigset_t* set = ( sigset_t* ) arg;
+    int s, sig;
+    for( ;; ){
+        /* 第二个步骤，调用 sigwait 等待信号 */
+        s = sigwait( set, &sig );
+        if ( s != 0 )
+            handle_error_en( s, "sigwait" );
+        printf( "Signal handling thread got signal %d\n", sig );
+    }
+}
+int main( int argc, char* argv[] ){
+    pthread_t thread;
+    sigset_t set;
+    int s;
+    /* 第一个步骤，在主线程种设置信号掩码 */
+    sigemptyset( &set );
+    sigaddset( &set, SIGQUIT );
+    sigaddset( &set, SIGUSR1 );
+    s = pthread_sigmask( SIG_BLOCK, &set, NULL );
+    if ( s != 0 )
+        handle_error_en( s, "pthread_sigmask" );
+    s = pthread_create( &thread, NULL, &sig_thread, (void*)&set );
+    if( s != 0 )
+        handle_error_en( s, "pthread_create" );
+    pause();
+}
+```
+
+最后，`pthread`还提供了下面的方法，使得我们可以明确地将一个信号发送给指定地线程：
+
+```cpp
+#include <signal.h>
+int pthread_kill( pthread_t thread, int sig );
+```
+
+- thread 指定目标线程
+- sig 指定待发送的信号。如果 `sig` 为 0，则 `pthread_kill` 不发送信号，但它仍会执行错误检查。我们可以利用这种方式来检测目标线程是否存在
+
