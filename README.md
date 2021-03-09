@@ -33,6 +33,72 @@ readv 函数和 writev 函数
  ssize_t writev( int fd, const struct iovec* vector, int count );
  ```
 
+## dup函数和dup2函数
+
+有时，我们希望把标准输入重定向到一个文件，或者把标准输出重定向到一个网络连接（比如CGI编程）。这可以通过下面用于复制文件描述符的 `dup` 或 `dup2` 函数实现
+
+```cpp
+#include <unistd.h>
+int dup( int file_desriptor );
+int dup2( int file_description_one, int file_descriptor_two )
+```
+
+dup 创建一个新的文件描述符，该新文件描述符和原有文件描述符 `file_descriptor`指向相同的文件、管道或者网络连接，并且 `dup` 返回的文件描述符总是取系统当前可用的最小整数值。`dup2`和 `dup` 类似，不过它将返回第一个不小于 `file_descriptor_two`的整数值。
+
+**CGI.cpp**
+
+```cpp
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <assert.h>
+
+int main( int argc, char* argv[] ){
+    if( argc <= 2 ){
+        printf( "usage: %s ip_address port_number\n", basename( argv[0] ) );
+        return 1;
+    }
+    const char* ip = argv[1];
+    int port = atoi( argv[2] );
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    inet_pton( AF_INET, ip, &address.sin_addr );
+    address.sin_port = htons( port );
+
+    int sock = socket( PF_INET, SOCK_STREAM, 0 );
+    assert( sock >= 0 );
+
+    int ret = bind( sock, ( struct sockaddr*)&address, sizeof( address ) );
+    assert( ret != -1 );
+    
+    ret = listen( sock, 5 );
+    assert( ret != -1 );
+
+    struct sockaddr_in client;
+    socklen_t client_addrlength = sizeof( client );
+    int connfd = accept( sock, ( struct sockaddr*)&client, &client_addrlength );
+    if( connfd < 0 ){
+        printf( "errno is: %d\n", errno );
+    }
+    else{
+        close( STDOUT_FILENO );
+        dup( connfd );
+        printf( "abcd\n" );
+        close( connfd );
+    }
+    close( sock );
+    return  0;
+}
+```
+
+该代码清单中，我们先关闭标准输出文件描述符 `STDOUT_FILENO` ( 其值为 1 )，然后复制 `socket` 文件描述符 `connfd`。因为 `dup` 总是返回系统中最小的可用文件描述符，所以它的返回值实际上是1，即之前关闭的标准输出文件描述符的值。这样，服务器输出到标准输出的内容(" 这里是 abcd ")就会直接发送到客户连接对应的 `socket` 上，因此 `printf` 调用的输出将被客户端获得。这就是 CGI 服务器的基本工作原理
+
  ## sendfile 函数
 
  `sendfile` 函数在两个文件描述符之间直接传递数据 ( 完全在内核中操作 )，从而避免了内核缓冲区和用户缓冲区之间的数据拷贝，效率很高，这被称为零拷贝。 `sendfile` 函数定义如下：
@@ -2370,3 +2436,69 @@ int pthread_kill( pthread_t thread, int sig );
 - thread 指定目标线程
 - sig 指定待发送的信号。如果 `sig` 为 0，则 `pthread_kill` 不发送信号，但它仍会执行错误检查。我们可以利用这种方式来检测目标线程是否存在
 
+# 第15章 进程池和线程池
+
+在之前的学习种，都是通过动态创建子进程（或子线程）来实现并发服务器的。但这样的做法有如下缺点：
+
+- 动态创建进程（或线程）是比较耗费时间的，这将导致较慢的客户相应
+- 动态创建的子进程（或子线程）通常只用来为一个客户服务，这将导致系统上产生大量的细微进程（或线程）。进程（或线程）间的切换将消耗大量 CPU 事件
+- 动态创建的子进程是当前进程的完整映像。当前进程必须谨慎地管理其分配的文件描述符和堆内存等系统资源，否则子进程可能复制这些资源，从而使系统的可用资源极具下降，进而影响服务器性能
+
+## 15.1 进程池和线程池概述
+
+进程池和线程池相似，所以这里以进程池为例。
+
+进程池是由服务器预先创建的一组子进程，这些子进程的数目在 3 ~ 10 个之间。`httpd` 守护进程就是使用包含 7 个子进程的进程池来实现并发的。线程池中的线程数量应该和 CPU 数量差不多
+
+进程池中的所有子进程都运行着相同的代码，并具有相同的属性，比如优先级、`PGID` 等。因为进程池在服务器启动之初就创建好了，所以每个子进程都相对“干净”，即它们没有打开不必要的文件描述符（从父进程继承而来），也不会错误地使用大块地堆内存（从父进程复制得到）。
+
+当有新的任务到来时，主进程通过某种方式选择进程池中地某一个子进程来为之服务。相比于动态创建子进程，选择一个已经存在地子进程的代价显然要小得多。只与主进程选择哪个子进程来为新任务服务，则有两种方式：
+
+- 主进程使用某种算法来主动选择子进程。最简单、最常用的算法是随机算法和 `Round Robin`(轮流选取)算法，但更优秀、更只能的算法将使任务在各个工作进程中更均匀地分配，从而减轻服务器的整体压力
+- 主进程和所有子进程通过一个共享的工作队列来同步，子进程同睡眠在该工作队列上。当有新的任务到来时，主进程将任务添加到工作队列中。这将唤醒正在等待任务的子进程，不过只有一个子进程将获得新任务的“接管权”，它可以从工作队列中取出任务并执行之，而其他子进程将继续睡眠在工作队列上
+
+当选择好子进程后，主进程还需要使用某种通知机制来告诉目标子进程有新任务需要处理， 并传递毕要的数据。最简单的方法是，在父进程和子进程之间预先建立好一条管道，然后通过该管道来实现所有的进程间通信（需要预先定义好一套协议来规范管道的使用）。在父进程和子进程之间传递数据简单得多，因为可以把这些数据定义为`全局`的，那它们本身就是被所有线程共享的。
+
+<img src="../../Typora_note/Linux%25E9%25AB%2598%25E6%2580%25A7%25E8%2583%25BD%25E6%259C%258D%25E5%258A%25A1%25E5%2599%25A8/image/0A15346C299702681967211A30B7ECCC.png" alt="0A15346C299702681967211A30B7ECCC" style="zoom:50%;" />
+
+## 15.2 处理多用户
+
+在使用进程池处理多客户任务时，首先要考虑的一个问题是：监听 `socket` 和连接 `socket` 是否都由主线程来统一管理。如第 8 章介绍的几种并发模式，其中`半同步 / 半反应堆`模式是由主进程统一管理这两种 `socket` 的；而高效的`半同步 / 半异步`模式，以及`领导者 / 追随者`模式，则是由主进程管理所有监听 `socket`，而各个子进程分别管理属于自己的连接的 `socket`。对于前一种情况，主进程接收新的连接以得到连接 `socket`，然后它需要将该 `socket` 传递给子进程（ 对于线程池而言，父进程将 `socket` 传递给子进程时很简单的，因为它们可以很容易地共享该 `socket `。但对于进程池而言，必须使用`在进程间传递文件描述符`的方式来传递该 `socket`，而只需要简单地通知一声：“我检测到新的连接，你来接受它” ）。
+
+对于一个客户的多次请求可以复用一个 TCP 连接，称为常连接。在设计进程池时还需要考虑：一个客户连接上的所有任务是否始终由一个子进程来处理。如果说客户任务是无状态的，那么我们可以靠v了使用不同的子进程来为该客户的不同请求服务
+
+<img src="../../Typora_note/Linux%25E9%25AB%2598%25E6%2580%25A7%25E8%2583%25BD%25E6%259C%258D%25E5%258A%25A1%25E5%2599%25A8/image/9D4E71E3EE6DB3C8F5DE81570A285DB2.png" alt="9D4E71E3EE6DB3C8F5DE81570A285DB2" style="zoom:50%;" />
+
+但如果客户任务是存在上下文关系的，则最好一直用同一个进程来为之服务，否则实现起来将比较麻烦。之前讨论的 `epoll` 的 `EPOLLONESHOT` 事件，这一事件能够确保一个客户连接在整个声明周期中仅被一个线程处理
+
+在使用 ET 时，一个线程或进程在读取完某个 socket 上的数据后开始处理数据，而在这个过程中该 socket 上又有新数据可读(EPOLLIN再次触发)，此时另外一个线程被唤醒来读取这些新的数据。于是就出现了两个线程同时操作一个 socket 的局面。所以，可以通过 epoll 的 EPOLLONESHOT 事件来实现
+
+> 对于注册了 EPOLLONESHOT 事件的文件描述符，操作系统最多触发其上注册的一个可读、可写或者异常事件，且只触发一次，除非我们使用 epoll_ctl 函数重置该文件描述符上注册的 EPOLLONESHOT 事件。所以，当该 socket 被某个线程处理完毕，就应该立即重置 EPOLLONESHOT 事件。
+
+## 15.3 半同步 / 半异步进程池实现
+
+本节实现如图所示的半同步/半异步并发模式的进程池
+
+<img src="../../Typora_note/Linux%25E9%25AB%2598%25E6%2580%25A7%25E8%2583%25BD%25E6%259C%258D%25E5%258A%25A1%25E5%2599%25A8/image/image-20210303110718588.png" alt="image-20210303110718588" style="zoom:50%;" />
+
+为了避免在父、子进程之间传递文件描述符，我们将接收新连接的操作放到子进程中。显然这种模式，一个客户链接上的所有任务始终是由一个子进程来处理的
+
+**processpoll.h**
+
+## 15.4 用进程池实现的简单 CGI 服务器
+
+通过线程池来实现一个并发的 CGI 服务器
+
+**CGI_server.cpp**
+
+**第六章 CGI.cpp**
+
+![image-20210304123735942](image/image-20210304123735942.png)
+
+![image-20210304123755936](image/image-20210304123755936.png)
+
+![image-20210304123814666](../../Typora_note/Linux%25E9%25AB%2598%25E6%2580%25A7%25E8%2583%25BD%25E6%259C%258D%25E5%258A%25A1%25E5%2599%25A8/image/image-20210304123814666.png)
+
+![image-20210304123832114](../../Typora_note/Linux%25E9%25AB%2598%25E6%2580%25A7%25E8%2583%25BD%25E6%259C%258D%25E5%258A%25A1%25E5%2599%25A8/image/image-20210304123832114.png)
+
+## 15.5 半同步 / 半反应堆线程池实现
